@@ -1,6 +1,6 @@
 import difflib, glob, json, os, re, secrets, shlex, subprocess, threading, time, uuid
 import requests as http
-from flask import Flask, jsonify, request, send_file, abort, redirect
+from flask import Flask, jsonify, request, send_file, abort, redirect, Response
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -99,8 +99,8 @@ def find_item(item_id):
 
 
 def public_view(item, include_stream=False):
-    v = {k: item[k] for k in ("id", "video_id", "title", "artist", "thumbnail",
-                               "duration", "status", "requested_by", "added_at")}
+    v = {k: item.get(k) for k in ("id", "video_id", "title", "artist", "thumbnail",
+                                   "duration", "status", "requested_by", "added_at", "progress")}
     if include_stream:
         # /api/ prefix matters: nginx only proxies paths under /api/ to this
         # backend on both ports — everything else falls through to its SPA
@@ -167,11 +167,11 @@ def _duration_close_enough(candidate_sec, expected_sec, pct=0.15, floor=15):
 
 def check_navidrome_duplicate(title, artist, duration_sec):
     """Search Navidrome's own library via the Subsonic API for a song that's
-    already a good match for this request. Returns the matching {title,
-    artist} dict if found, else None. Best-effort: any failure (Navidrome
-    unreachable, not configured, etc.) is treated as 'no match found' —
-    this check existing is a nice-to-have, not something that should ever
-    block a request from going through."""
+    already a good match for this request. Returns {title, artist, duration,
+    navidrome_song_id} if found, else None — the caller uses navidrome_song_id
+    to stream the existing copy directly instead of downloading a new one.
+    Best-effort: any failure (Navidrome unreachable, not configured, etc.) is
+    treated as 'no match found', never as a reason to block the request."""
     if not (NAVIDROME_URL and NAVIDROME_USER):
         return None
     query = _normalize_title(title)[:60] or (title or "")[:60]
@@ -197,7 +197,8 @@ def check_navidrome_duplicate(title, artist, duration_sec):
             continue
         if not _duration_close_enough(cand_duration, duration_sec):
             continue
-        return {"title": cand_title, "artist": cand_artist}
+        return {"title": cand_title, "artist": cand_artist, "duration": cand_duration,
+                "navidrome_song_id": song.get("id")}
     return None
 
 
@@ -243,11 +244,45 @@ def ffprobe_duration(path):
         return None
 
 
+_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+
+def _set_item_progress(item_id, pct):
+    with state_lock:
+        cur = find_item(item_id)
+        if cur:
+            cur["progress"] = pct
+
+def _run_with_progress(cmd, item_id, timeout=180):
+    """Like subprocess.run, but parses yt-dlp's own --newline progress
+    output live and pushes each update straight into the queue item, so the
+    request page can show a real progress bar instead of a static
+    'downloading…' label. Returns an object with .returncode/.stderr,
+    matching what the rest of download_track()'s error handling expects."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, bufsize=1)
+    killer = threading.Timer(timeout, proc.kill)
+    killer.start()
+    lines = []
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            m = _PROGRESS_RE.search(line)
+            if m:
+                _set_item_progress(item_id, float(m.group(1)))
+    finally:
+        killer.cancel()
+    proc.wait()
+    result = type("Result", (), {})()
+    result.returncode = proc.returncode
+    result.stderr = "".join(lines)
+    return result
+
 def download_track(item):
     """Download + loudness-normalize straight to FLAC, exactly like
     Spotidrome's own downloads, so playback and the permanent library copy
     are identical files."""
     out_path = os.path.join(DOWNLOAD_DIR, f"{item['id']}.flac")
+    _set_item_progress(item["id"], 0)
 
     def attempt(pot_args):
         cmd = ["yt-dlp",
@@ -256,9 +291,9 @@ def download_track(item):
                "--add-metadata", "--embed-thumbnail",
                "--output", out_path.replace(".flac", ".%(ext)s"),
                "--no-playlist", "--retries", "2", "--fragment-retries", "2",
-               "--socket-timeout", "10", "--no-progress",
+               "--socket-timeout", "10", "--newline",
                ] + pot_args + [item["url"]]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        return _run_with_progress(cmd, item["id"])
 
     r = attempt(YTDLP_POT_ARGS)
     needs_fallback = r.returncode != 0 or not os.path.exists(out_path)
@@ -269,6 +304,7 @@ def download_track(item):
         # (legacy itag 18, ~96kbps AAC transcoded to FLAC) since android's
         # proper adaptive audio streams are themselves currently blocked by
         # a separate YouTube-side SABR restriction.
+        _set_item_progress(item["id"], 0)  # fresh attempt, previous % is stale
         r = attempt(_pot_args_for_client("android"))
 
     if r.returncode != 0 or not os.path.exists(out_path):
@@ -463,8 +499,6 @@ def route_queue_add():
     # shared in-memory state, and shouldn't hold up every other request
     # while it's in flight.
     match = check_navidrome_duplicate(title, artist, duration)
-    if match:
-        return jsonify({"error": f"Already in your library as \"{match['title']}\" by {match['artist']}"}), 409
 
     with state_lock:
         active_ids = {i["video_id"] for i in state["queue"] if i["status"] in ("queued", "downloading", "ready", "playing")}
@@ -473,12 +507,29 @@ def route_queue_add():
 
         item = {
             "id": uuid.uuid4().hex[:12],
-            "video_id": video_id, "url": url, "title": title, "artist": artist, "duration": duration,
+            "video_id": video_id, "url": url,
             "thumbnail": data.get("thumbnail") or "",
             "requested_by": (data.get("requested_by") or "Anonymous").strip()[:40] or "Anonymous",
-            "status": "queued", "added_at": time.time(),
+            "added_at": time.time(), "progress": 0,
         }
+        if match:
+            # Already in the library — queue it, but play the existing copy
+            # straight off Navidrome instead of downloading a new one.
+            item["title"] = match["title"]
+            item["artist"] = match["artist"]
+            item["duration"] = match["duration"] or duration
+            item["navidrome_song_id"] = match["navidrome_song_id"]
+            item["status"] = "ready"
+        else:
+            item["title"] = title
+            item["artist"] = artist
+            item["duration"] = duration
+            item["status"] = "queued"
         state["queue"].append(item)
+        # A track that skipped straight to "ready" (the Navidrome-match
+        # case) needs this nudge itself — normally only a finished download
+        # triggers it, and this item never goes through that path at all.
+        _promote_next_if_idle()
         save_state()
         return jsonify(public_view(item))
 
@@ -513,11 +564,38 @@ def route_player_advance():
     return jsonify({"ok": True})
 
 
+def _proxy_navidrome_stream(song_id):
+    """Pipe audio straight from Navidrome's own Subsonic stream endpoint —
+    used for a track that turned out to already be in the library, so it
+    plays from the existing copy instead of a redundant fresh download.
+    Proxied (rather than redirecting the browser straight to Navidrome)
+    so Navidrome's credentials never reach the client, and so the <audio>
+    element sees same-origin audio either way — matters for
+    createMediaElementSource, which throws on cross-origin-tainted media."""
+    headers = {}
+    if request.headers.get("Range"):
+        headers["Range"] = request.headers["Range"]
+    try:
+        upstream = http.get(f"{NAVIDROME_URL}/rest/stream", params={
+            "id": song_id, "u": NAVIDROME_USER, "p": NAVIDROME_PASSWORD,
+            "v": "1.16.1", "c": "jamidrome",
+        }, headers=headers, stream=True, timeout=30)
+    except Exception:
+        abort(502)
+    excluded = {"content-encoding", "transfer-encoding", "connection"}
+    resp_headers = [(k, v) for k, v in upstream.headers.items() if k.lower() not in excluded]
+    return Response(upstream.iter_content(chunk_size=65536),
+                     status=upstream.status_code, headers=resp_headers)
+
+
 @app.route("/stream/<item_id>")
 def route_stream(item_id):
     with state_lock:
         item = find_item(item_id)
         path = item.get("local_path") if item else None
+        nd_song_id = item.get("navidrome_song_id") if item else None
+    if nd_song_id:
+        return _proxy_navidrome_stream(nd_song_id)
     if not path or not os.path.exists(path):
         abort(404)
     return send_file(path, mimetype="audio/flac", conditional=True)
@@ -578,6 +656,14 @@ def route_invite_consume(token):
 
 
 load_state()
+with state_lock:
+    # If the queue already had a ready track waiting at the head when the
+    # process last stopped, nothing would otherwise promote it to actually
+    # play again — that only happens as a side effect of a download
+    # finishing or /player/advance being called, neither of which is
+    # guaranteed to happen any time soon after a restart.
+    _promote_next_if_idle()
+    save_state()
 threading.Thread(target=download_worker_loop, daemon=True).start()
 threading.Thread(target=watchdog_loop, daemon=True).start()
 

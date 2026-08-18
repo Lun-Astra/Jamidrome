@@ -29,7 +29,8 @@ body::before{content:'';position:fixed;inset:0;
 #overlay .sub{color:var(--text2);font-size:14px}
 #overlay .btn{background:var(--sp);color:#06210f;border:none;border-radius:40px;padding:16px 36px;font-size:16px;font-weight:700;cursor:pointer}
 
-.art-wrap{width:min(38vh,320px);height:min(38vh,320px);border-radius:20px;overflow:hidden;background:var(--bg3);box-shadow:0 30px 80px rgba(0,0,0,.5);margin-bottom:28px}
+#playing-view{display:flex;flex-direction:column;align-items:center}
+.art-wrap{width:min(38vh,320px);height:min(38vh,320px);border-radius:20px;overflow:hidden;background:var(--bg3);box-shadow:0 30px 80px rgba(0,0,0,.5);margin-bottom:28px;flex-shrink:0}
 .art-wrap img{width:100%;height:100%;object-fit:cover;display:block}
 .title{font-family:var(--font2);font-size:clamp(20px,4vw,36px);font-weight:700;max-width:900px}
 .artist{color:var(--text2);font-size:clamp(13px,1.6vw,18px);margin-top:8px}
@@ -49,6 +50,8 @@ body::before{content:'';position:fixed;inset:0;
 .un-item img{width:30px;height:30px;border-radius:6px;object-fit:cover;flex-shrink:0}
 .un-item .t{font-size:11.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .un-item .s{font-size:10px;color:var(--text3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.un-item .dl-bar{height:4px;background:var(--bg4);border-radius:2px;margin-top:4px;overflow:hidden}
+.un-item .dl-bar-fill{height:100%;background:linear-gradient(90deg,var(--sp),var(--nd));transition:width .4s linear}
 
 .top-right{position:fixed;top:22px;right:28px;display:flex;align-items:center;gap:10px;z-index:5}
 #skip-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer}
@@ -230,7 +233,7 @@ async function poll(){
 
 function render(d){
   const np = d.now_playing;
-  document.getElementById('playing-view').style.display = np ? 'block' : 'none';
+  document.getElementById('playing-view').style.display = np ? 'flex' : 'none';
   document.getElementById('idle-view').style.display = np ? 'none' : 'block';
   document.getElementById('skip-btn').style.display = np ? 'block' : 'none';
 
@@ -259,9 +262,11 @@ function render(d){
   un.innerHTML = (d.up_next || []).slice(0, 6).map(i => `
     <div class="un-item">
       <img src="${esc(i.thumbnail)}">
-      <div style="min-width:0">
+      <div style="min-width:0;flex:1">
         <div class="t">${esc(i.title)}</div>
-        <div class="s">${i.status === 'downloading' ? '⬇ downloading…' : i.status === 'ready' ? '✅ ready' : '⏳ queued'}</div>
+        ${i.status === 'downloading'
+          ? `<div class="dl-bar"><div class="dl-bar-fill" style="width:${Math.max(2, i.progress || 0)}%"></div></div>`
+          : `<div class="s">${i.status === 'ready' ? '✅ ready' : '⏳ queued'}</div>`}
       </div>
     </div>`).join('');
 }

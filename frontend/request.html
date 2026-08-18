@@ -56,6 +56,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .status-badge{font-size:10px;padding:3px 8px;border-radius:20px;font-weight:600;flex-shrink:0;white-space:nowrap}
 .status-badge.queued{background:var(--bg4);color:var(--text2)}
 .status-badge.downloading{background:rgba(245,158,11,.12);color:#fbbf24}
+.q-item .dl-bar{height:4px;background:var(--bg4);border-radius:2px;margin-top:5px;overflow:hidden}
+.q-item .dl-bar-fill{height:100%;background:linear-gradient(90deg,var(--sp),var(--nd));transition:width .4s linear}
 .status-badge.ready{background:rgba(30,215,96,.12);color:#4ade80}
 .remove-btn{background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:2px 4px;flex-shrink:0}
 .remove-btn:hover{color:#f87171}
@@ -174,8 +176,9 @@ async function refreshQueue(){
         <div class="info">
           <div class="t">${esc(item.title)}</div>
           <div class="s">${esc(item.artist)} · requested by ${esc(item.requested_by)}</div>
+          ${item.status === 'downloading' ? `<div class="dl-bar"><div class="dl-bar-fill" style="width:${Math.max(2, item.progress || 0)}%"></div></div>` : ''}
         </div>
-        <span class="status-badge ${item.status}">${item.status}</span>
+        <span class="status-badge ${item.status}">${item.status === 'downloading' ? Math.round(item.progress || 0) + '%' : item.status}</span>
         ${item.status === 'queued' ? `<button class="remove-btn" onclick="removeItem('${item.id}')" title="Remove">✕</button>` : ''}
       </div>`).join('');
   }catch(e){}
