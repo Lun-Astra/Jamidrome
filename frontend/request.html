@@ -144,14 +144,16 @@ async function removeItem(id){
   refreshQueue();
 }
 
-let _lastHash = '';
 async function refreshQueue(){
   try{
     const r = await fetch(`${API}/queue`);
     const d = await r.json();
-    const hash = JSON.stringify([d.now_playing, d.queue.map(q=>[q.id,q.status])]);
-    if(hash === _lastHash) return; _lastHash = hash;
-
+    // No early-return-if-unchanged here: now_playing's own fields (id,
+    // title, duration, ...) don't change while a track is still playing,
+    // so a "skip if unchanged" hash never changes either — that silently
+    // froze the progress bar every poll, only ever updating on a full
+    // page reload, since the elapsed time driving it is computed fresh
+    // client-side and isn't part of the response at all.
     const np = document.getElementById('now-playing');
     if(d.now_playing){
       const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
