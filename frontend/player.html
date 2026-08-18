@@ -50,10 +50,21 @@ body::before{content:'';position:fixed;inset:0;
 .un-item .t{font-size:11.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .un-item .s{font-size:10px;color:var(--text3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-#skip-btn{position:fixed;top:22px;right:28px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer}
+.top-right{position:fixed;top:22px;right:28px;display:flex;align-items:center;gap:10px;z-index:5}
+#skip-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer}
 #skip-btn:hover{color:var(--text)}
+.vol-ctrl{display:flex;align-items:center;gap:7px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:7px 14px}
+.vol-ctrl button{background:none;border:none;color:var(--text2);font-size:14px;cursor:pointer;line-height:1}
+.vol-ctrl button:hover{color:var(--text)}
+.vol-ctrl input[type=range]{width:90px;accent-color:var(--sp);cursor:pointer}
 #invite-btn{position:fixed;top:22px;left:28px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;z-index:5}
 #invite-btn:hover{color:var(--text)}
+
+#audio-unlock{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);display:none;
+  background:var(--sp);color:#06210f;border:none;border-radius:24px;padding:12px 24px;
+  font-size:14px;font-weight:700;cursor:pointer;z-index:15;box-shadow:0 10px 30px rgba(0,0,0,.4)}
+
+#viz{width:min(70vw,520px);height:64px;margin-top:18px;display:block}
 
 #invite-modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:20;display:none;align-items:center;justify-content:center}
 #invite-modal.show{display:flex}
@@ -84,8 +95,15 @@ body::before{content:'';position:fixed;inset:0;
 </div>
 
 <div class="logo"><span class="j">Jam</span><span class="arr">→</span><span class="d">Drome</span></div>
-<button id="skip-btn" onclick="skip()" style="display:none">⏭ Skip</button>
+<div class="top-right">
+  <div class="vol-ctrl">
+    <button id="mute-btn" onclick="toggleMute()">🔊</button>
+    <input type="range" id="vol-slider" min="0" max="100" value="100">
+  </div>
+  <button id="skip-btn" onclick="skip()" style="display:none">⏭ Skip</button>
+</div>
 <button id="invite-btn" onclick="openInvite()">🔗 Invite</button>
+<button id="audio-unlock" onclick="tryPlay()">🔇 Tap to enable sound</button>
 
 <div id="invite-modal">
   <div class="im-card">
@@ -120,6 +138,7 @@ body::before{content:'';position:fixed;inset:0;
       <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
       <div class="times"><span id="t-elapsed">0:00</span><span id="t-total">0:00</span></div>
     </div>
+    <canvas id="viz" width="520" height="64"></canvas>
   </div>
   <div id="idle-view" class="idle">
     <div class="big">Waiting for requests…</div>
@@ -144,12 +163,50 @@ const audio = document.getElementById('audio');
   }catch(e){}
 })();
 
-function startJam(){
-  document.getElementById('overlay').style.display = 'none';
-  // Register the user gesture with a silent play/pause so later
-  // programmatic .play() calls aren't blocked by autoplay policy.
+// ── Volume ───────────────────────────────────────────────────────────────
+const volSlider = document.getElementById('vol-slider');
+const muteBtn = document.getElementById('mute-btn');
+let savedVolume = parseInt(localStorage.getItem('jam_volume') ?? '100', 10);
+volSlider.value = savedVolume;
+audio.volume = savedVolume / 100;
+function updateMuteIcon(){ muteBtn.textContent = (audio.muted || audio.volume === 0) ? '🔇' : (audio.volume < 0.5 ? '🔉' : '🔊'); }
+volSlider.addEventListener('input', () => {
+  audio.volume = volSlider.value / 100;
   audio.muted = false;
-  audio.play().catch(()=>{});
+  localStorage.setItem('jam_volume', volSlider.value);
+  updateMuteIcon();
+});
+function toggleMute(){ audio.muted = !audio.muted; updateMuteIcon(); }
+updateMuteIcon();
+
+// ── Playback / autoplay unlock ──────────────────────────────────────────
+// audio.play() can be blocked by the browser's autoplay policy even after
+// a user gesture, depending on browser/OS quirks — rather than fail
+// silently (which is exactly what "no sound, no idea why" looks like from
+// the outside), show a real button whenever a play() call is rejected so
+// there's always a working way to actually start the sound.
+function tryPlay(){
+  const p = audio.play();
+  const unlock = document.getElementById('audio-unlock');
+  if(p && p.then){
+    p.then(() => { unlock.style.display = 'none'; })
+     .catch(() => { unlock.style.display = 'block'; });
+  }
+}
+
+async function startJam(){
+  document.getElementById('overlay').style.display = 'none';
+  audio.muted = false;
+  setupAudioGraph();
+  try{ if(audioCtx && audioCtx.state === 'suspended') await audioCtx.resume(); }catch(e){}
+  // Fetch + play chained directly from this click (not via a later
+  // setTimeout) so the very first real playback is as tightly linked to
+  // the user gesture as possible — the safest way to get autoplay allowed.
+  try{
+    const r = await fetch(`${API}/player/state`);
+    const d = await r.json();
+    render(d);
+  }catch(e){}
   poll();
 }
 
@@ -157,7 +214,6 @@ function fmt(s){s=Math.max(0,Math.round(s||0));return`${Math.floor(s/60)}:${Stri
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 let currentId = null;
-let barTimer = null;
 
 async function poll(){
   try{
@@ -183,7 +239,7 @@ function render(d){
       document.getElementById('req').textContent = `requested by ${np.requested_by}`;
       document.getElementById('t-total').textContent = fmt(np.duration);
       audio.src = np.stream_url;
-      audio.play().catch(()=>{});
+      tryPlay();
     }
     const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
     const pct = np.duration ? Math.min(100, elapsed/np.duration*100) : 0;
@@ -263,6 +319,46 @@ async function refreshInviteList(){
 async function revokeInvite(token){
   await fetch(`${API}/invite/${token}/revoke`, {method:'POST'});
   refreshInviteList();
+}
+
+// ── Visualizer ───────────────────────────────────────────────────────────
+// createMediaElementSource reroutes the <audio> element's output through
+// the Web Audio graph — sound only keeps playing if the source is
+// (re)connected all the way to audioCtx.destination, so that connection
+// is exactly as important here as tapping the analyser is.
+let audioCtx = null, analyser = null, freqData = null;
+function setupAudioGraph(){
+  if(audioCtx) return;
+  try{
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaElementSource(audio);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 128;
+    source.connect(analyser);
+    analyser.connect(audioCtx.destination);
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    requestAnimationFrame(drawVisualizer);
+  }catch(e){ console.warn('[jam] visualizer unavailable:', e); }
+}
+
+function drawVisualizer(){
+  requestAnimationFrame(drawVisualizer);
+  const canvas = document.getElementById('viz');
+  if(!analyser || !canvas || canvas.offsetParent === null) return;
+  analyser.getByteFrequencyData(freqData);
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const barCount = freqData.length;
+  const barWidth = w / barCount;
+  for(let i = 0; i < barCount; i++){
+    const barHeight = (freqData[i] / 255) * h;
+    const grad = ctx.createLinearGradient(0, h - barHeight, 0, h);
+    grad.addColorStop(0, '#1ed760');
+    grad.addColorStop(1, '#8b5cf6');
+    ctx.fillStyle = grad;
+    ctx.fillRect(i * barWidth, h - barHeight, Math.max(1, barWidth - 1), barHeight);
+  }
 }
 </script>
 </body>
