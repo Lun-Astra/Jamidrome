@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jamidrome — Request a song</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0d0d12;--bg2:#13131a;--bg3:#1a1a24;--bg4:#22222e;
+  --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);
+  --sp:#1ed760;--sp2:#17a349;--nd:#8b5cf6;--nd2:#6d28d9;
+  --text:#f0f0f8;--text2:#9090b0;--text3:#5a5a7a;
+  --r:10px;--r2:14px;--font:'Inter',sans-serif;--font2:'Space Grotesk',sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
+.app{max-width:720px;margin:0 auto;padding:20px 16px 80px}
+header{display:flex;align-items:center;justify-content:space-between;padding:8px 0 20px;flex-wrap:wrap;gap:10px}
+.logo{font-family:var(--font2);font-size:22px;font-weight:700;letter-spacing:-0.5px}
+.logo .j{color:var(--sp)}.logo .arr{color:var(--text3);margin:0 3px;font-weight:400}.logo .d{color:var(--nd)}
+.name-field{display:flex;align-items:center;gap:6px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:5px 10px 5px 12px}
+.name-field input{background:none;border:none;color:var(--text);font-size:12px;width:110px;outline:none}
+.name-field span{font-size:11px;color:var(--text3)}
+
+.now-playing{background:linear-gradient(135deg,rgba(30,215,96,.08),rgba(139,92,246,.08));border:1px solid var(--border2);border-radius:var(--r2);padding:12px 14px;display:flex;gap:12px;align-items:center;margin-bottom:18px}
+.now-playing img{width:48px;height:48px;border-radius:8px;object-fit:cover;flex-shrink:0;background:var(--bg4)}
+.now-playing .np-title{font-weight:600;font-size:13px}
+.now-playing .np-artist{font-size:11px;color:var(--text2)}
+.now-playing .np-empty{font-size:12px;color:var(--text3)}
+.np-bar{height:3px;background:var(--bg4);border-radius:2px;margin-top:6px;overflow:hidden}
+.np-bar-fill{height:100%;background:var(--sp);width:0%;transition:width 1s linear}
+
+.search-row{display:flex;gap:8px;margin-bottom:14px}
+.search-row input{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:11px 14px;color:var(--text);font-size:14px;outline:none}
+.search-row input:focus{border-color:var(--border2)}
+.btn{border:none;border-radius:var(--r);padding:11px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
+.btn:hover{opacity:.88}.btn:disabled{opacity:.5;cursor:default}
+.btn-sp{background:var(--sp);color:#06210f}
+.btn-ghost{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}
+
+.section-title{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;font-weight:500;margin:18px 0 8px}
+.results{display:flex;flex-direction:column;gap:8px}
+.card{display:flex;gap:12px;align-items:center;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:10px}
+.card img{width:52px;height:52px;border-radius:6px;object-fit:cover;background:var(--bg4);flex-shrink:0}
+.card .info{flex:1;min-width:0}
+.card .t{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .s{font-size:11px;color:var(--text3);margin-top:2px}
+.card .dur{font-size:11px;color:var(--text3);flex-shrink:0}
+
+.q-item{display:flex;gap:12px;align-items:center;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:9px 10px}
+.q-item img{width:40px;height:40px;border-radius:6px;object-fit:cover;background:var(--bg4);flex-shrink:0}
+.q-item .info{flex:1;min-width:0}
+.q-item .t{font-size:12.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.q-item .s{font-size:10.5px;color:var(--text3);margin-top:1px}
+.status-badge{font-size:10px;padding:3px 8px;border-radius:20px;font-weight:600;flex-shrink:0;white-space:nowrap}
+.status-badge.queued{background:var(--bg4);color:var(--text2)}
+.status-badge.downloading{background:rgba(245,158,11,.12);color:#fbbf24}
+.status-badge.ready{background:rgba(30,215,96,.12);color:#4ade80}
+.remove-btn{background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:2px 4px;flex-shrink:0}
+.remove-btn:hover{color:#f87171}
+
+.empty{padding:24px;text-align:center;color:var(--text3);font-size:12.5px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--bg4);border:1px solid var(--border2);border-radius:20px;padding:10px 18px;font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;pointer-events:none;z-index:50}
+.toast.show{opacity:1}
+.spin{width:13px;height:13px;border:2px solid rgba(255,255,255,.15);border-top-color:currentColor;border-radius:50%;animation:rot .6s linear infinite;display:inline-block}
+@keyframes rot{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo"><span class="j">Jam</span><span class="arr">→</span><span class="d">Drome</span></div>
+    <div class="name-field"><span>I'm</span><input id="name-input" placeholder="Anonymous" maxlength="40"></div>
+  </header>
+
+  <div class="now-playing" id="now-playing">
+    <div class="np-empty">Nothing playing yet — be the first to add a song.</div>
+  </div>
+
+  <div class="search-row">
+    <input id="search-input" placeholder="Search for a song…" autocomplete="off">
+    <button class="btn btn-sp" id="search-btn" onclick="doSearch()">Search</button>
+  </div>
+  <div class="results" id="results"></div>
+
+  <div class="section-title">Up Next (<span id="queue-count">0</span>)</div>
+  <div class="results" id="queue-list"><div class="empty">Queue is empty</div></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '/api';
+const nameInput = document.getElementById('name-input');
+nameInput.value = localStorage.getItem('jam_name') || '';
+nameInput.addEventListener('input', () => localStorage.setItem('jam_name', nameInput.value));
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function fmtDur(s){if(!s)return'';s=Math.round(s);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;}
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2200);}
+
+async function doSearch(){
+  const q = document.getElementById('search-input').value.trim();
+  if(!q) return;
+  const btn = document.getElementById('search-btn');
+  btn.disabled = true; const orig = btn.innerHTML; btn.innerHTML = '<span class="spin"></span>';
+  const box = document.getElementById('results');
+  box.innerHTML = '<div class="empty"><div class="spin"></div></div>';
+  try{
+    const r = await fetch(`${API}/search?q=${encodeURIComponent(q)}`);
+    const d = await r.json();
+    if(!d.results || !d.results.length){box.innerHTML = '<div class="empty">No results</div>'; return;}
+    box.innerHTML = d.results.map(res => `
+      <div class="card">
+        <img src="${esc(res.thumbnail)}" loading="lazy">
+        <div class="info">
+          <div class="t">${esc(res.title)}</div>
+          <div class="s">${esc(res.artist)}</div>
+        </div>
+        <div class="dur">${fmtDur(res.duration)}</div>
+        <button class="btn btn-ghost" onclick='addToQueue(${JSON.stringify(res).replace(/'/g,"&apos;")}, this)'>+ Add</button>
+      </div>`).join('');
+  }catch(e){box.innerHTML = '<div class="empty">Search failed</div>';}
+  finally{btn.disabled = false; btn.innerHTML = orig;}
+}
+document.getElementById('search-input').addEventListener('keydown', e => { if(e.key === 'Enter') doSearch(); });
+
+async function addToQueue(res, btnEl){
+  btnEl.disabled = true; btnEl.textContent = '…';
+  try{
+    const r = await fetch(`${API}/queue/add`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({...res, requested_by: nameInput.value.trim() || 'Anonymous'})});
+    const d = await r.json();
+    if(!r.ok){toast(d.error || 'Could not add'); btnEl.disabled = false; btnEl.textContent = '+ Add'; return;}
+    btnEl.textContent = '✓ Added'; toast(`Added "${res.title}" to the queue`);
+    refreshQueue();
+  }catch(e){toast('Failed: ' + e.message); btnEl.disabled = false; btnEl.textContent = '+ Add';}
+}
+
+async function removeItem(id){
+  await fetch(`${API}/queue/${id}/remove`, {method:'POST'});
+  refreshQueue();
+}
+
+let _lastHash = '';
+async function refreshQueue(){
+  try{
+    const r = await fetch(`${API}/queue`);
+    const d = await r.json();
+    const hash = JSON.stringify([d.now_playing, d.queue.map(q=>[q.id,q.status])]);
+    if(hash === _lastHash) return; _lastHash = hash;
+
+    const np = document.getElementById('now-playing');
+    if(d.now_playing){
+      const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
+      const pct = d.now_playing.duration ? Math.min(100, elapsed/d.now_playing.duration*100) : 0;
+      np.innerHTML = `
+        <img src="${esc(d.now_playing.thumbnail)}">
+        <div style="flex:1;min-width:0">
+          <div class="np-title">${esc(d.now_playing.title)}</div>
+          <div class="np-artist">${esc(d.now_playing.artist)} · requested by ${esc(d.now_playing.requested_by)}</div>
+          <div class="np-bar"><div class="np-bar-fill" style="width:${pct}%"></div></div>
+        </div>`;
+    } else {
+      np.innerHTML = '<div class="np-empty">Nothing playing yet — be the first to add a song.</div>';
+    }
+
+    document.getElementById('queue-count').textContent = d.queue.length;
+    const list = document.getElementById('queue-list');
+    if(!d.queue.length){ list.innerHTML = '<div class="empty">Queue is empty</div>'; return; }
+    list.innerHTML = d.queue.map(item => `
+      <div class="q-item">
+        <img src="${esc(item.thumbnail)}">
+        <div class="info">
+          <div class="t">${esc(item.title)}</div>
+          <div class="s">${esc(item.artist)} · requested by ${esc(item.requested_by)}</div>
+        </div>
+        <span class="status-badge ${item.status}">${item.status}</span>
+        ${item.status === 'queued' ? `<button class="remove-btn" onclick="removeItem('${item.id}')" title="Remove">✕</button>` : ''}
+      </div>`).join('');
+  }catch(e){}
+}
+refreshQueue();
+setInterval(refreshQueue, 1800);
+</script>
+</body>
+</html>

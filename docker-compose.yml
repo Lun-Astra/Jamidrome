@@ -1,0 +1,33 @@
+version: "3.9"
+
+# Joins Spotidrome's own docker network instead of creating a new one, so
+# this app can reach Spotidrome's already-running bgutil-pot-provider
+# container directly (no need to run a second copy of it).
+networks:
+  default:
+    name: spotidrome_default
+    external: true
+
+services:
+  jam-frontend:
+    build: ./frontend
+    ports:
+      - "9998:9998"
+      - "9999:9999"
+    depends_on:
+      - jam-backend
+    restart: unless-stopped
+
+  # Named jam-backend (not "backend") because this network is shared with
+  # Spotidrome, whose own service is itself named "backend" — same name on
+  # a shared network means Docker's DNS round-robins between BOTH
+  # containers, so half of all requests would silently land on the wrong
+  # app's backend and 404.
+  jam-backend:
+    build: ./backend
+    env_file:
+      - ../spotidrome/.env
+    volumes:
+      - ~/.ssh:/root/.ssh
+      - ./data:/data
+    restart: unless-stopped
