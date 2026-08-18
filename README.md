@@ -34,6 +34,18 @@ Both talk to the same Flask backend, which:
    player page gets closed or the browser hiccups, so the jam doesn't get
    stuck waiting for a signal that may never arrive.
 
+## Inviting people
+
+The player page (`:9999`) has a **🔗 Invite** button (top-left). Pick how
+long the link should stay valid (15 minutes up to 24 hours), hit Generate,
+and share the resulting `http://<host>:9999/invite/<token>` link — anyone
+who opens it gets redirected straight to the request page (`:9998`) on
+whatever hostname/IP they reached it by. Each Generate mints a brand new,
+independent link (generating another one doesn't invalidate earlier ones),
+and a link is reusable by anyone who has it until it expires or you revoke
+it from the same modal. There's no per-person limit or accounts — it's a
+"whoever has the link" model, same trust level as the rest of the app.
+
 ## Setup
 
 Reuses Spotidrome's `.env` directly (`SSH_HOST`/`SSH_USER`/`SSH_PORT`/

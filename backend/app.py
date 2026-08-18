@@ -1,5 +1,5 @@
-import glob, json, os, re, shlex, subprocess, threading, time, uuid
-from flask import Flask, jsonify, request, send_file, abort
+import glob, json, os, re, secrets, shlex, subprocess, threading, time, uuid
+from flask import Flask, jsonify, request, send_file, abort, redirect
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -41,6 +41,9 @@ MAX_HISTORY         = 50
 ADVANCE_BUFFER_SEC   = 5     # grace period added on top of a track's own duration
                              # before the server auto-advances without a client signal
 SEARCH_RESULT_COUNT  = 10
+REQUEST_PAGE_PORT    = 9998
+MIN_INVITE_TTL_SEC   = 60
+MAX_INVITE_TTL_SEC   = 7 * 24 * 3600
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -48,8 +51,12 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # queue:  ordered, not-yet-finished items — status one of
 #         queued -> downloading -> ready -> playing
 # history: finished (done/failed) items, most recent last, capped at MAX_HISTORY
+# invites: token -> {created_at, expires_at, ttl_seconds} — share links minted
+#          from the player page; each one is independent (generating a new
+#          one does not invalidate earlier ones) and reusable by anyone who
+#          has it until it expires.
 state_lock = threading.Lock()
-state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None}
+state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None, "invites": {}}
 
 
 def load_state():
@@ -288,6 +295,29 @@ def watchdog_loop():
             advance()
 
 
+# ─── Invite links ────────────────────────────────────────────────────────────
+# Minted from the player page (:9999) so the host can hand out a link that
+# drops people straight onto the request page (:9998) — one row of state per
+# generated link, each independently timed out.
+
+def _prune_expired_invites():
+    """Must be called with state_lock held."""
+    now = time.time()
+    expired = [t for t, inv in state["invites"].items() if inv["expires_at"] <= now]
+    for t in expired:
+        del state["invites"][t]
+
+
+def _request_page_url():
+    # $http_host (forwarded below as X-Forwarded-Host) preserves whatever
+    # host:port the browser actually sent, unlike nginx's own $host which
+    # strips the port — needed here since the link has to swap :9999 for
+    # :9998 on whatever hostname/IP someone is actually browsing from.
+    host_hdr = request.headers.get("X-Forwarded-Host") or request.host or ""
+    hostname = host_hdr.split(":")[0] or "localhost"
+    return f"http://{hostname}:{REQUEST_PAGE_PORT}/"
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.route("/search")
@@ -376,6 +406,60 @@ def route_stream(item_id):
     if not path or not os.path.exists(path):
         abort(404)
     return send_file(path, mimetype="audio/flac", conditional=True)
+
+
+@app.route("/invite/create", methods=["POST"])
+def route_invite_create():
+    data = request.json or {}
+    try:
+        ttl_seconds = int(data.get("ttl_seconds"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "ttl_seconds must be a number"}), 400
+    ttl_seconds = max(MIN_INVITE_TTL_SEC, min(MAX_INVITE_TTL_SEC, ttl_seconds))
+
+    with state_lock:
+        _prune_expired_invites()
+        token = secrets.token_urlsafe(9)
+        now = time.time()
+        state["invites"][token] = {"created_at": now, "expires_at": now + ttl_seconds, "ttl_seconds": ttl_seconds}
+        save_state()
+        return jsonify({"token": token, "created_at": now, "expires_at": now + ttl_seconds,
+                         "path": f"/invite/{token}"})
+
+
+@app.route("/invite/list")
+def route_invite_list():
+    with state_lock:
+        _prune_expired_invites()
+        save_state()
+        invites = [{"token": t, **inv} for t, inv in state["invites"].items()]
+    invites.sort(key=lambda i: i["created_at"], reverse=True)
+    return jsonify({"invites": invites})
+
+
+@app.route("/invite/<token>/revoke", methods=["POST"])
+def route_invite_revoke(token):
+    with state_lock:
+        state["invites"].pop(token, None)
+        save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/invite/<token>")
+def route_invite_consume(token):
+    with state_lock:
+        _prune_expired_invites()
+        valid = token in state["invites"]
+    if valid:
+        return redirect(_request_page_url(), code=302)
+    return ("""<!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Jamidrome</title>
+        <style>body{background:#0d0d12;color:#f0f0f8;font-family:sans-serif;
+        display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
+        text-align:center;padding:24px}</style></head>
+        <body><div><h2>This invite link has expired</h2>
+        <p style="color:#9090b0">Ask whoever's hosting for a fresh one.</p></div></body></html>""", 404)
 
 
 load_state()
