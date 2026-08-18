@@ -150,6 +150,15 @@ def _title_close_enough(candidate_title, expected_title):
     words = [w for w in exp_n.split() if len(w) > 2]
     return bool(words) and sum(1 for w in words if w in cand_n) / len(words) >= 0.6
 
+def _split_camel_case(s):
+    """Insert spaces at lower->upper transitions — YouTube channel names
+    very often glue the artist name directly onto a suffix with no
+    separator at all (e.g. 'LuisFonsiVEVO', 'SkilletMusic'), which would
+    otherwise tokenize as one solid word that can't overlap with anything
+    ('luisfonsivevo' shares no words with 'luis fonsi') even though the
+    channel is unambiguously that artist."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s or "")
+
 def _artist_close_enough(candidate_artist, expected_artist):
     """candidate_artist is Navidrome's clean tagged artist; expected_artist
     is whatever came off YouTube (channel/uploader name), which is often
@@ -157,8 +166,8 @@ def _artist_close_enough(candidate_artist, expected_artist):
     clean "Bonnie Tyler" tag. Checked as word-overlap in both directions
     rather than requiring either string to contain the other whole, since
     neither side is reliably the "clean" one to substring-match against."""
-    cand = re.sub(r"\s*-\s*topic$", "", (candidate_artist or "").lower()).strip()
-    exp = (expected_artist or "").lower().strip()
+    cand = re.sub(r"\s*-\s*topic$", "", _split_camel_case(candidate_artist or "").lower()).strip()
+    exp = _split_camel_case(expected_artist or "").lower().strip()
     if not cand or not exp:
         return not cand and not exp
     if cand in exp or exp in cand:
@@ -358,15 +367,55 @@ def lookup_real_album(url, timeout=15):
     except Exception:
         return None
 
+def lookup_album_from_spotify(title, artist):
+    """Spotify's own catalog, searched by title+artist — a much more
+    reliable album source than yt-dlp's embedded video metadata for
+    Jamidrome's case specifically: unlike Spotidrome (which starts from a
+    real Spotify track and only falls back to yt-dlp's metadata in the
+    rare case Spotify's own album field is somehow missing), every
+    Jamidrome request starts from a plain YouTube search with no Spotify
+    data at all, and plenty of real videos — lyric videos, "visualizer"
+    uploads, fan uploads — simply don't carry album/release tags for
+    yt-dlp to find, even though the track is unambiguously a real,
+    catalogued release."""
+    sp = get_sp()
+    if not sp:
+        return None
+    try:
+        # A field-qualified "track:"/"artist:" filter is too strict here —
+        # Jamidrome's "artist" is often just a YouTube channel name (a
+        # VEVO channel, a cover/compilation channel, a name with no space
+        # before a suffix at all — "LuisFonsiVEVO" for "Luis Fonsi") rather
+        # than the real Spotify artist name, so a strict filter reliably
+        # finds nothing for those. Free-text search instead, then vet each
+        # candidate with the exact same title/artist fuzzy-matching this
+        # app already uses for everything else, rather than trusting
+        # Spotify's own top result blindly.
+        query = f"{_normalize_title(title)} {primary_artist(artist)}".strip()
+        result = sp.search(q=query, type="track", limit=5)
+        for item in result.get("tracks", {}).get("items", []):
+            if not _title_close_enough(item.get("name", ""), title):
+                continue
+            if not any(_artist_close_enough(a.get("name", ""), artist)
+                       for a in item.get("artists", [])):
+                continue
+            name = (item.get("album") or {}).get("name")
+            if name and name.strip():
+                return name.strip()
+    except Exception as e:
+        print(f"[jam] Spotify album lookup failed for {title!r}/{artist!r}: {e}", file=sys.stderr)
+    return None
+
 def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_url, local_dir, album_artist=None):
     """If album looks like a placeholder (empty/'Unknown Album'/the playlist
-    name itself), look up the real album via yt-dlp and move the file into
-    the corrected album folder. Returns (album, flac_path), updated if
+    name itself), look up the real album — Spotify's catalog first, then
+    yt-dlp's own video metadata as a fallback — and move the file into the
+    corrected album folder. Returns (album, flac_path), updated if
     corrected."""
     normalized = (album or "").strip().lower()
     if normalized not in BAD_ALBUM_VALUES and normalized != (playlist_name or "").strip().lower():
         return album, flac_path
-    real_album = lookup_real_album(source_url)
+    real_album = lookup_album_from_spotify(title, artist) or lookup_real_album(source_url)
     if not real_album or real_album.strip().lower() == normalized:
         return album, flac_path
     try:
