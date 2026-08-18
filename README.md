@@ -24,24 +24,42 @@ Both talk to the same Flask backend, which:
 1. Downloads the picked track via `yt-dlp` straight to FLAC, loudness-
    normalized to the same target Spotidrome's own downloads use, so it
    doesn't stick out volume-wise.
-2. Plays it **immediately from that local download** the moment it's
+2. Tags it properly — real genre from Spotify's catalog (falling back to
+   YouTube's own video tags the same way Spotidrome does), and a real
+   album looked up via `yt-dlp` if one isn't already embedded, rather than
+   being left with YouTube's generic embedded metadata (genre always just
+   "Music"; album usually empty). This logic is copied in from Spotidrome
+   (same functions, same tolerances) rather than Jamidrome calling into it
+   at runtime — it stays a fully standalone app, just tags exactly as well
+   as a normal Spotidrome-synced track instead of a thinner version of it.
+3. Plays it **immediately from that local download** the moment it's
    ready — it does not wait on Navidrome.
-3. Separately, in the background, rsyncs a copy into the Navidrome
+4. Separately, in the background, rsyncs a copy into the Navidrome
    library (under a `Jam/` folder) and triggers a scan, purely so the
    track ends up archived permanently. This never blocks or delays
    playback.
-4. Refuses to add a song that's already sitting in the queue (or currently
+5. Refuses to add a song that's already sitting in the queue (or currently
    playing) a second time.
-5. Separately checks Navidrome's own library (via its Subsonic API) for a
+6. Separately checks Navidrome's own library (via its Subsonic API) for a
    track that's already a good match by title/artist/duration, using the
    same matching tolerances Spotidrome uses to vet its own download
    candidates. If it's already there, the request still joins the queue —
    it just streams straight from the existing Navidrome copy instead of
    downloading a redundant new one, skipping the download step entirely.
-6. Auto-advances the queue when a track ends — driven by the player page's
-   own `ended` event, with a server-side timer as a fallback in case the
-   player page gets closed or the browser hiccups, so the jam doesn't get
-   stuck waiting for a signal that may never arrive.
+7. Auto-advances the queue when a track ends — driven by the player page's
+   own `ended` event, with a server-side timer as a fallback in case every
+   player session gets closed or the browser hiccups, so the jam doesn't
+   get stuck waiting for a signal that may never arrive. Idempotent by
+   design: several independent player sessions can be open at once (see
+   below), and might all reach 'ended' on the same track around the same
+   moment — only the first one actually advances the queue.
+
+The player page is multi-session: open it in as many browsers/tabs as you
+want (different rooms, everyone's own phone, whatever) — each one plays the
+shared queue independently, with its own **⏸ Pause** you control without
+affecting anyone else's. Reloading the page (or resuming from pause) picks
+up wherever the shared timeline currently is rather than restarting the
+track from 0:00.
 
 ## Inviting people
 
@@ -75,9 +93,13 @@ with no proxy in front.
 ## Setup
 
 Reuses Spotidrome's `.env` directly (`SSH_HOST`/`SSH_USER`/`SSH_PORT`/
-`SSH_MUSIC_PATH`/`NAVIDROME_URL`/`NAVIDROME_USER`/`NAVIDROME_PASSWORD`) and
-its already-authorized SSH key (`~/.ssh/id_rsa` on the host) — nothing to
-configure here as long as Spotidrome is already set up on this machine.
+`SSH_MUSIC_PATH`/`NAVIDROME_URL`/`NAVIDROME_USER`/`NAVIDROME_PASSWORD`/
+`SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`/`SPOTIFY_REDIRECT_URI`) and its
+already-authorized SSH key and Spotify OAuth token cache (`~/.ssh/id_rsa`
+and `~/.ssh/.spotify_cache` on the host) — nothing to configure or
+re-authenticate here as long as Spotidrome is already set up on this
+machine. Genre lookup just falls back to YouTube's own video tags if
+Spotify was never connected through Spotidrome at all.
 
 It also joins Spotidrome's docker network (`spotidrome_default`) so it can
 reach Spotidrome's `bgutil-pot` container instead of running a second one —

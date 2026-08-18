@@ -54,8 +54,8 @@ body::before{content:'';position:fixed;inset:0;
 .un-item .dl-bar-fill{height:100%;background:linear-gradient(90deg,var(--sp),var(--nd));transition:width .4s linear}
 
 .top-right{position:fixed;top:22px;right:28px;display:flex;align-items:center;gap:10px;z-index:5}
-#skip-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer}
-#skip-btn:hover{color:var(--text)}
+#skip-btn,#pause-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer}
+#skip-btn:hover,#pause-btn:hover{color:var(--text)}
 .vol-ctrl{display:flex;align-items:center;gap:7px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:7px 14px}
 .vol-ctrl button{background:none;border:none;color:var(--text2);font-size:14px;cursor:pointer;line-height:1}
 .vol-ctrl button:hover{color:var(--text)}
@@ -67,7 +67,7 @@ body::before{content:'';position:fixed;inset:0;
   background:var(--sp);color:#06210f;border:none;border-radius:24px;padding:12px 24px;
   font-size:14px;font-weight:700;cursor:pointer;z-index:15;box-shadow:0 10px 30px rgba(0,0,0,.4)}
 
-#viz{width:min(70vw,520px);height:64px;margin-top:18px;display:block}
+#viz{width:min(70vw,520px);height:64px;margin:18px auto 0;display:block}
 
 #invite-modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:20;display:none;align-items:center;justify-content:center}
 #invite-modal.show{display:flex}
@@ -103,6 +103,7 @@ body::before{content:'';position:fixed;inset:0;
     <button id="mute-btn" onclick="toggleMute()">🔊</button>
     <input type="range" id="vol-slider" min="0" max="100" value="100">
   </div>
+  <button id="pause-btn" onclick="togglePause()" style="display:none">⏸ Pause</button>
   <button id="skip-btn" onclick="skip()" style="display:none">⏭ Skip</button>
 </div>
 <button id="invite-btn" onclick="openInvite()">🔗 Invite</button>
@@ -201,6 +202,30 @@ function tryPlay(){
   }
 }
 
+// ── Pause (local to this browser only) ──────────────────────────────────
+// Each open player page is its own independent session now — pausing here
+// doesn't touch the shared queue or affect anyone else watching. Resuming
+// jumps back to wherever the shared timeline currently is, rather than
+// the stale position from whenever this browser paused.
+let userPaused = false;
+function updatePauseIcon(){
+  document.getElementById('pause-btn').textContent = userPaused ? '▶ Play' : '⏸ Pause';
+}
+function togglePause(){
+  if(userPaused){
+    userPaused = false;
+    if(lastPlaybackStartedAt && lastDuration){
+      const elapsed = Date.now()/1000 - lastPlaybackStartedAt;
+      if(elapsed < lastDuration) audio.currentTime = elapsed;
+    }
+    tryPlay();
+  } else {
+    userPaused = true;
+    audio.pause();
+  }
+  updatePauseIcon();
+}
+
 async function startJam(){
   document.getElementById('overlay').style.display = 'none';
   audio.muted = false;
@@ -231,13 +256,21 @@ async function poll(){
   setTimeout(poll, 1000);
 }
 
+// Tracked so the pause button can resync to wherever the shared timeline
+// currently is when resuming, and so a page reload mid-track picks up
+// from the right position instead of restarting at 0.
+let lastPlaybackStartedAt = null, lastDuration = null;
+
 function render(d){
   const np = d.now_playing;
   document.getElementById('playing-view').style.display = np ? 'flex' : 'none';
   document.getElementById('idle-view').style.display = np ? 'none' : 'block';
   document.getElementById('skip-btn').style.display = np ? 'block' : 'none';
+  document.getElementById('pause-btn').style.display = np ? 'block' : 'none';
 
   if(np){
+    lastPlaybackStartedAt = d.playback_started_at;
+    lastDuration = np.duration;
     if(np.id !== currentId){
       currentId = np.id;
       document.getElementById('art').src = np.thumbnail || '';
@@ -245,15 +278,27 @@ function render(d){
       document.getElementById('artist').textContent = np.artist;
       document.getElementById('req').textContent = `requested by ${np.requested_by}`;
       document.getElementById('t-total').textContent = fmt(np.duration);
+      // Seek to wherever the shared timeline already is — this is a fresh
+      // <audio> load (new track, or this page just loaded/reloaded mid-
+      // track), so without this it would always start over from 0:00.
+      const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
       audio.src = np.stream_url;
+      audio.addEventListener('loadedmetadata', function seekOnce(){
+        audio.currentTime = elapsed;
+      }, {once: true});
+      userPaused = false;
+      updatePauseIcon();
       tryPlay();
     }
-    const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
-    const pct = np.duration ? Math.min(100, elapsed/np.duration*100) : 0;
-    document.getElementById('bar-fill').style.width = pct + '%';
-    document.getElementById('t-elapsed').textContent = fmt(elapsed);
+    if(!userPaused){
+      const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
+      const pct = np.duration ? Math.min(100, elapsed/np.duration*100) : 0;
+      document.getElementById('bar-fill').style.width = pct + '%';
+      document.getElementById('t-elapsed').textContent = fmt(elapsed);
+    }
   } else {
     currentId = null;
+    userPaused = false;
     audio.pause();
     audio.removeAttribute('src');
   }
@@ -271,8 +316,15 @@ function render(d){
     </div>`).join('');
 }
 
-audio.addEventListener('ended', () => { fetch(`${API}/player/advance`, {method:'POST'}); });
-function skip(){ fetch(`${API}/player/advance`, {method:'POST'}); }
+// expected_id makes this idempotent — with multiple independent sessions
+// now possible, more than one could reach 'ended' on the same track around
+// the same real moment; the server only actually advances once for it.
+function requestAdvance(){
+  fetch(`${API}/player/advance`, {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({expected_id: currentId})});
+}
+audio.addEventListener('ended', requestAdvance);
+function skip(){ requestAdvance(); }
 
 // ── Invite links ──────────────────────────────────────────────────────────
 function fmtRemaining(expiresAt){
@@ -361,6 +413,15 @@ function setupAudioGraph(){
   try{
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 128;
+    // getByteFrequencyData maps [minDecibels, maxDecibels] linearly onto
+    // 0-255. The Web Audio defaults (-100 to -30 dBFS) put "max height" at
+    // a level normal music clears constantly, even in its quiet passages
+    // — bars end up looking near-maxed almost all the time regardless of
+    // how loud the track actually is. Widening this range gives quiet
+    // moments genuinely short bars and reserves tall ones for genuinely
+    // loud moments.
+    analyser.minDecibels = -90;
+    analyser.maxDecibels = -10;
     source.connect(analyser);
     freqData = new Uint8Array(analyser.frequencyBinCount);
     requestAnimationFrame(drawVisualizer);
@@ -378,15 +439,24 @@ function drawVisualizer(){
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
-  const barCount = freqData.length;
-  const barWidth = w / barCount;
-  for(let i = 0; i < barCount; i++){
+  // Mirrored outward from the center (low frequencies innermost, high
+  // frequencies at the outer edges) rather than a plain left-to-right
+  // sweep — a left-to-right layout reliably looks lopsided in practice
+  // since bass frequencies dominate the low end of the spectrum, making
+  // the whole thing look tilted toward one side regardless of how well
+  // the canvas itself is centered on the page.
+  const half = Math.max(1, Math.floor(freqData.length / 2));
+  const barWidth = (w / 2) / half;
+  const center = w / 2;
+  for(let i = 0; i < half; i++){
     const barHeight = (freqData[i] / 255) * h;
     const grad = ctx.createLinearGradient(0, h - barHeight, 0, h);
     grad.addColorStop(0, '#1ed760');
     grad.addColorStop(1, '#8b5cf6');
     ctx.fillStyle = grad;
-    ctx.fillRect(i * barWidth, h - barHeight, Math.max(1, barWidth - 1), barHeight);
+    const bw = Math.max(1, barWidth - 1);
+    ctx.fillRect(center + i * barWidth, h - barHeight, bw, barHeight);
+    ctx.fillRect(center - (i + 1) * barWidth, h - barHeight, bw, barHeight);
   }
 }
 </script>

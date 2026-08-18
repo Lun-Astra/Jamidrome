@@ -1,7 +1,11 @@
-import difflib, glob, json, os, re, secrets, shlex, subprocess, threading, time, uuid
+import difflib, glob, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, uuid
 import requests as http
 from flask import Flask, jsonify, request, send_file, abort, redirect, Response
 from flask_cors import CORS
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, error as ID3Error
 
 app = Flask(__name__)
 CORS(app)
@@ -22,6 +26,14 @@ SSH_MUSIC_PATH = os.environ.get("SSH_MUSIC_PATH", "/opt/navidrome/music")
 NAVIDROME_URL      = os.environ.get("NAVIDROME_URL", "").rstrip("/")
 NAVIDROME_USER     = os.environ.get("NAVIDROME_USER", "")
 NAVIDROME_PASSWORD = os.environ.get("NAVIDROME_PASSWORD", "")
+
+# Genre lookup needs Spotify — reuses the SAME cached OAuth token Spotidrome
+# already keeps refreshed at this path (both apps share the ~/.ssh bind
+# mount), rather than Jamidrome needing its own separate login flow.
+SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8080/callback")
+SPOTIFY_CACHE_PATH    = "/root/.ssh/.spotify_cache"
 
 # Same loudness target Spotidrome normalizes its own downloads to, so a
 # jam-requested track sits at the same volume as everything else in the
@@ -99,7 +111,7 @@ def find_item(item_id):
 
 
 def public_view(item, include_stream=False):
-    v = {k: item.get(k) for k in ("id", "video_id", "title", "artist", "thumbnail",
+    v = {k: item.get(k) for k in ("id", "video_id", "title", "artist", "thumbnail", "album", "genre",
                                    "duration", "status", "requested_by", "added_at", "progress")}
     if include_stream:
         # /api/ prefix matters: nginx only proxies paths under /api/ to this
@@ -202,6 +214,174 @@ def check_navidrome_duplicate(title, artist, duration_sec):
     return None
 
 
+# ─── Tagging & genre lookup ──────────────────────────────────────────────────
+# Copied from Spotidrome (not called into it — Jamidrome stays standalone,
+# no runtime dependency on it being up) so a jam-requested track gets
+# exactly the same real genre tag and "Unknown Album" correction a normal
+# Spotidrome-synced track does, rather than being left with whatever
+# generic tags YouTube's own embedded metadata provides (genre always just
+# "Music"; album usually empty or the video's own title).
+
+def sanitize(name):
+    return re.sub(r'[\\/*?:"<>|]', "_", name)
+
+def primary_artist(artist):
+    return (artist or "").split(",")[0].strip()
+
+def get_sp():
+    """Reuses Spotidrome's own cached Spotify OAuth token (same cache file,
+    same ~/.ssh bind mount) rather than Jamidrome needing its own separate
+    login flow — Spotidrome already keeps it refreshed for its own genre
+    lookups. Returns None if there's no cached token yet (Spotify was never
+    connected through Spotidrome) or refresh fails; either way, genre
+    lookup just falls back to the YouTube-tag method below."""
+    try:
+        auth = SpotifyOAuth(
+            client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET,
+            redirect_uri=SPOTIFY_REDIRECT_URI,
+            scope="playlist-read-private playlist-read-collaborative user-library-read",
+            cache_path=SPOTIFY_CACHE_PATH, open_browser=False)
+        token = auth.get_cached_token()
+        if not token:
+            return None
+        if auth.is_token_expired(token):
+            token = auth.refresh_access_token(token["refresh_token"])
+        return spotipy.Spotify(auth=token["access_token"])
+    except Exception as e:
+        print(f"[jam] Spotify auth unavailable: {e}", file=sys.stderr)
+        return None
+
+YT_GENRE_KEYWORDS = {
+    "drum and bass", "drum n bass", "dnb", "death metal", "black metal",
+    "thrash metal", "heavy metal", "nu metal", "metalcore", "deathcore",
+    "hard rock", "soft rock", "hip hop", "hip-hop", "r&b", "rnb", "k-pop",
+    "j-pop", "new age", "synthwave", "lo-fi", "lofi", "drill", "grime",
+    "rock", "pop", "metal", "rap", "soul", "jazz", "blues", "country",
+    "folk", "classical", "electronic", "house", "techno", "trance",
+    "dubstep", "reggae", "ska", "punk", "indie", "alternative", "grunge",
+    "emo", "funk", "disco", "gospel", "ambient", "edm", "garage", "opera",
+    "latin", "soundtrack",
+}
+
+def lookup_genre_from_youtube(artist):
+    key = primary_artist(artist).strip()
+    if not key:
+        return None
+    cmd = ["yt-dlp", "--dump-json", "--no-playlist",
+           "--default-search", "https://music.youtube.com/search?q=",
+           f"ytsearch3:{key}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+    except Exception:
+        return None
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            info = json.loads(line)
+        except Exception:
+            continue
+        for tag in (info.get("tags") or []):
+            normalized = re.sub(r"[^a-z0-9&\- ]", "", tag.lower()).strip()
+            if normalized in YT_GENRE_KEYWORDS:
+                return normalized.title()
+    return None
+
+_genre_cache = {}
+_genre_cache_lock = threading.Lock()
+
+def lookup_genre(artist):
+    """Spotify's catalog first, falling back to YouTube tags when Spotify
+    has nothing for this artist. Cached per artist for the process's life."""
+    if not artist:
+        return None
+    key = primary_artist(artist).lower()
+    if not key:
+        return None
+    with _genre_cache_lock:
+        if key in _genre_cache:
+            return _genre_cache[key]
+    genre = None
+    sp = get_sp()
+    if sp:
+        try:
+            result = sp.search(q=f"artist:{key}", type="artist", limit=1)
+            items = result.get("artists", {}).get("items", [])
+            if items:
+                genres = items[0].get("genres") or []
+                if genres:
+                    genre = genres[0].title()
+        except Exception as e:
+            print(f"[jam] Spotify genre lookup failed for {artist!r}: {e}", file=sys.stderr)
+    if not genre:
+        try:
+            genre = lookup_genre_from_youtube(artist)
+        except Exception as e:
+            print(f"[jam] YouTube genre fallback failed for {artist!r}: {e}", file=sys.stderr)
+    with _genre_cache_lock:
+        _genre_cache[key] = genre
+    return genre
+
+def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None, genre=None):
+    album_artist = album_artist or artist
+    try:
+        tags = FLAC(filepath)
+        tags["title"] = [title]
+        tags["artist"] = [artist]
+        tags["album"] = [album]
+        tags["albumartist"] = [album_artist]
+        if source_url:
+            tags["comment"] = [source_url]
+        if genre:
+            tags["genre"] = [genre]
+        tags.save()
+    except Exception as e:
+        print(f"[jam] Tag fix failed for {filepath}: {e}", file=sys.stderr)
+
+BAD_ALBUM_VALUES = {"", "unknown album"}
+
+def lookup_real_album(url, timeout=15):
+    """Ask yt-dlp for the real album/release of a track, without downloading it."""
+    if not url:
+        return None
+    try:
+        cmd = ["yt-dlp", "--dump-json", "--no-playlist", "--skip-download",
+               "--socket-timeout", "10", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        info = json.loads(result.stdout.strip().split("\n")[0])
+        album = (info.get("album") or info.get("release") or "").strip()
+        return album or None
+    except Exception:
+        return None
+
+def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_url, local_dir, album_artist=None):
+    """If album looks like a placeholder (empty/'Unknown Album'/the playlist
+    name itself), look up the real album via yt-dlp and move the file into
+    the corrected album folder. Returns (album, flac_path), updated if
+    corrected."""
+    normalized = (album or "").strip().lower()
+    if normalized not in BAD_ALBUM_VALUES and normalized != (playlist_name or "").strip().lower():
+        return album, flac_path
+    real_album = lookup_real_album(source_url)
+    if not real_album or real_album.strip().lower() == normalized:
+        return album, flac_path
+    try:
+        new_album_dir = os.path.join(local_dir, sanitize(real_album))
+        os.makedirs(new_album_dir, exist_ok=True)
+        new_path = os.path.join(new_album_dir, os.path.basename(flac_path))
+        if os.path.abspath(new_path) != os.path.abspath(flac_path):
+            shutil.move(flac_path, new_path)
+        fix_tags(new_path, title, artist, real_album, album_artist=album_artist, source_url=source_url)
+        return real_album, new_path
+    except Exception as e:
+        print(f"[jam] Album correction failed for {flac_path}: {e}", file=sys.stderr)
+        return album, flac_path
+
+
 # ─── yt-dlp search & download ───────────────────────────────────────────────
 
 def search_tracks(query, limit=SEARCH_RESULT_COUNT):
@@ -278,9 +458,13 @@ def _run_with_progress(cmd, item_id, timeout=180):
     return result
 
 def download_track(item):
-    """Download + loudness-normalize straight to FLAC, exactly like
-    Spotidrome's own downloads, so playback and the permanent library copy
-    are identical files."""
+    """Download, loudness-normalize, and tag straight to FLAC. Genre lookup
+    and 'Unknown Album' correction reuse the exact same approach Spotidrome
+    uses on its own downloads (see the Tagging & genre lookup section
+    above) — copied in rather than called into it, so a jam-requested
+    track ends up tagged exactly as well as a normal Spotidrome-synced one,
+    not left with YouTube's own generic embedded metadata (genre always
+    just "Music"; album usually empty)."""
     out_path = os.path.join(DOWNLOAD_DIR, f"{item['id']}.flac")
     _set_item_progress(item["id"], 0)
 
@@ -311,11 +495,22 @@ def download_track(item):
         _cleanup_downloaded_files(item["id"])  # yt-dlp can leave behind a
         # partial audio file, thumbnail, etc. even on a failed run
         raise RuntimeError((r.stderr or "yt-dlp failed")[-300:])
-    return out_path, ffprobe_duration(out_path)
+
+    genre = lookup_genre(item["artist"])
+    fix_tags(out_path, item["title"], item["artist"], "", album_artist=item["artist"],
+             source_url=item["url"], genre=genre)
+    album, out_path = maybe_correct_album(
+        out_path, item["title"], item["artist"], "", "Jam", item["url"], DOWNLOAD_DIR,
+        album_artist=item["artist"])
+
+    return out_path, ffprobe_duration(out_path), album, genre
 
 
 def _cleanup_downloaded_files(item_id):
-    for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{item_id}.*")):
+    # Recursive: maybe_correct_album can move the file into an
+    # album-named subfolder within DOWNLOAD_DIR, so a flat glob on
+    # DOWNLOAD_DIR itself would miss it after a correction.
+    for f in glob.glob(os.path.join(DOWNLOAD_DIR, "**", f"{item_id}.*"), recursive=True):
         try:
             os.remove(f)
         except Exception:
@@ -365,9 +560,17 @@ def _promote_next_if_idle():
         state["playback_started_at"] = time.time()
 
 
-def advance():
-    """Finish whatever's currently playing and promote the next ready item."""
+def advance(expected_id=None):
+    """Finish whatever's currently playing and promote the next ready item.
+    If expected_id is given, only acts when it still matches the current
+    now_playing_id — with multiple independent player sessions now allowed
+    (each browser has its own local play/pause state, all following the
+    same shared queue), more than one session can legitimately reach
+    'ended' on the same track around the same real moment and each try to
+    advance; without this guard that would skip two tracks instead of one."""
     with state_lock:
+        if expected_id is not None and state["now_playing_id"] != expected_id:
+            return
         cur_id = state["now_playing_id"]
         if cur_id:
             cur = find_item(cur_id)
@@ -399,10 +602,12 @@ def download_worker_loop():
             time.sleep(1)
             continue
         try:
-            local_path, duration = download_track(item)
+            local_path, duration, album, genre = download_track(item)
             with state_lock:
                 item["local_path"] = local_path
                 item["duration"] = duration or item.get("duration")
+                item["album"] = album
+                item["genre"] = genre
                 item["status"] = "ready"
                 _promote_next_if_idle()
                 save_state()
@@ -560,7 +765,8 @@ def route_player_state():
 
 @app.route("/player/advance", methods=["POST"])
 def route_player_advance():
-    advance()
+    data = request.json or {}
+    advance(expected_id=data.get("expected_id"))
     return jsonify({"ok": True})
 
 
@@ -663,7 +869,18 @@ with state_lock:
     # finishing or /player/advance being called, neither of which is
     # guaranteed to happen any time soon after a restart.
     _promote_next_if_idle()
+    # advance()'s 30s post-play cleanup timer is in-memory only — a track
+    # that finished right as the process restarted loses that timer and
+    # its local file sits there forever. Sweep for exactly that: any file
+    # whose id doesn't belong to a still-active queue item.
+    active_ids = {i["id"] for i in state["queue"]}
     save_state()
+for f in glob.glob(os.path.join(DOWNLOAD_DIR, "**", "*.flac"), recursive=True):
+    if os.path.splitext(os.path.basename(f))[0] not in active_ids:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
 threading.Thread(target=download_worker_loop, daemon=True).start()
 threading.Thread(target=watchdog_loop, daemon=True).start()
 

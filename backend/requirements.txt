@@ -2,5 +2,6 @@ flask==3.0.3
 flask-cors==4.0.1
 requests==2.32.3
 mutagen==1.47.0
+spotipy==2.24.0
 gunicorn==21.2.0
 yt-dlp>=2026.7.4
