@@ -9,9 +9,19 @@ instead of syncing whole playlists.
 
 ## Two front doors, one backend
 
-- **Request** (port `9998`). Open this on your phone. Search YouTube, pick
-  the result you meant, add it to the queue. Shows what's currently playing
+- **Request** (port `9998`). Open this on your phone. Search, pick the
+  result you meant, add it to the queue. Shows what's currently playing
   and who's up next.
+
+  Search checks YouTube Music's own "songs" category first — YouTube's
+  own classification of a result as an actual released track, which
+  specifically excludes covers, reuploads, lyric videos, and live
+  performances — so the real release shows up first (searching "Faint
+  Linkin Park" puts the actual Meteora track on top, not a lyric-video
+  reupload), with its real album name already known rather than guessed
+  at after downloading. Plain YouTube search only fills in whatever's left
+  (deduped), so covers/live versions are still findable, just never
+  crowding out the real thing.
 - **Player** (port `9999`). Open this once on whatever's connected to the
   speakers (a TV, an old laptop, whatever) and leave it open. It has no
   input of its own beyond a skip button — it just plays the queue,

@@ -1,4 +1,5 @@
 import difflib, glob, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, uuid
+from concurrent.futures import ThreadPoolExecutor
 import requests as http
 from flask import Flask, jsonify, request, send_file, abort, redirect, Response
 from flask_cors import CORS
@@ -6,6 +7,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, error as ID3Error
+from ytmusicapi import YTMusic
 
 app = Flask(__name__)
 CORS(app)
@@ -433,7 +435,86 @@ def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_u
 
 # ─── yt-dlp search & download ───────────────────────────────────────────────
 
-def search_tracks(query, limit=SEARCH_RESULT_COUNT):
+_ytmusic_client = None
+_ytmusic_disabled = False
+
+def _get_ytmusic():
+    """Lazily construct a shared YTMusic client, matching Spotidrome's own
+    pattern: if construction ever fails (e.g. no network at startup),
+    disable it for the rest of the process rather than retrying on every
+    single search."""
+    global _ytmusic_client, _ytmusic_disabled
+    if _ytmusic_disabled:
+        return None
+    if _ytmusic_client is None:
+        try:
+            _ytmusic_client = YTMusic()
+        except Exception as e:
+            print(f"[jam] YTMusic init failed, disabling: {e}", file=sys.stderr)
+            _ytmusic_disabled = True
+            return None
+    return _ytmusic_client
+
+def _search_ytmusic_songs(query, limit, timeout=12):
+    """YouTube Music's own 'songs' category — YouTube's own classification
+    of a result as an actual released track, curated to specifically
+    exclude covers, reuploads, lyric videos, and live performances (Spotify
+    catalog data isn't involved here at all — this is YouTube Music's own
+    metadata, the same signal Spotidrome uses to vet its download
+    candidates). Run with a hard timeout via a background thread since
+    ytmusicapi's HTTP calls have no timeout of their own."""
+    ytm = _get_ytmusic()
+    if not ytm:
+        return []
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(ytm.search, query, filter="songs", limit=limit)
+        results = future.result(timeout=timeout)
+    except Exception:
+        return []
+    finally:
+        executor.shutdown(wait=False)
+
+    # YT Music's own search matches loosely against the whole query, so a
+    # query like "linkin park faint" happily returns Numb/Crawling/Papercut
+    # too — anything by the matched artist, not just the song actually
+    # being searched for. Subtracting the query's own artist-name words
+    # leaves (roughly) just the song-title part the user typed, and each
+    # candidate's title needs to actually relate to that remainder —
+    # unless there's no remainder at all, i.e. the query was just an
+    # artist name with no particular song in mind, which should keep
+    # matching everything by them.
+    def words(s):
+        return {w for w in re.split(r"[^\w]+", (s or "").lower()) if len(w) > 2}
+
+    query_words = words(query)
+
+    out = []
+    for r in results or []:
+        video_id = r.get("videoId")
+        if not video_id:
+            continue
+        artists = ", ".join(a.get("name", "") for a in (r.get("artists") or []) if a.get("name"))
+        title = r.get("title") or "Unknown title"
+        leftover = query_words - words(artists)
+        if leftover and not (leftover & words(title)):
+            continue  # not actually related to what was searched
+        album = (r.get("album") or {}).get("name")
+        out.append({
+            "video_id": video_id,
+            "title": title,
+            "artist": artists or "Unknown artist",
+            "album": album,
+            "duration": r.get("duration_seconds"),
+            # Real video thumbnail rather than ytmusicapi's own (a small,
+            # low-res channel-icon-style image) — same CDN path the plain
+            # yt-dlp search results below already use, for visual consistency.
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            "url": f"https://music.youtube.com/watch?v={video_id}",
+        })
+    return out
+
+def _search_yt_dlp(query, limit):
     cmd = (["yt-dlp", "--dump-json", "--flat-playlist", "--no-playlist"] + YTDLP_POT_ARGS +
            [f"ytsearch{limit}:{query}"])
     try:
@@ -461,6 +542,22 @@ def search_tracks(query, limit=SEARCH_RESULT_COUNT):
             "url": e.get("webpage_url") or e.get("url"),
         })
     return out
+
+def search_tracks(query, limit=SEARCH_RESULT_COUNT):
+    """YouTube Music's 'songs' results go first — the real release, not a
+    reupload/cover/lyric video/live performance — with plain YouTube
+    search filling in the rest (deduped by video_id) so covers, live
+    versions, etc. are still findable, just never crowding out the real
+    thing at the top."""
+    songs = _search_ytmusic_songs(query, limit)
+    seen = {r["video_id"] for r in songs}
+    remaining = max(0, limit - len(songs))
+    generic = _search_yt_dlp(query, limit) if remaining else []
+    for r in generic:
+        if r["video_id"] not in seen:
+            songs.append(r)
+            seen.add(r["video_id"])
+    return songs[:limit]
 
 
 def ffprobe_duration(path):
@@ -545,11 +642,16 @@ def download_track(item):
         # partial audio file, thumbnail, etc. even on a failed run
         raise RuntimeError((r.stderr or "yt-dlp failed")[-300:])
 
+    # If the pick came from the YT Music 'songs' search tier, its own real
+    # album name is already known and authoritative — start from that
+    # instead of empty, so maybe_correct_album's placeholder check sees a
+    # real value and skips the guess-based lookup entirely.
+    known_album = item.get("known_album") or ""
     genre = lookup_genre(item["artist"])
-    fix_tags(out_path, item["title"], item["artist"], "", album_artist=item["artist"],
+    fix_tags(out_path, item["title"], item["artist"], known_album, album_artist=item["artist"],
              source_url=item["url"], genre=genre)
     album, out_path = maybe_correct_album(
-        out_path, item["title"], item["artist"], "", "Jam", item["url"], DOWNLOAD_DIR,
+        out_path, item["title"], item["artist"], known_album, "Jam", item["url"], DOWNLOAD_DIR,
         album_artist=item["artist"])
 
     return out_path, ffprobe_duration(out_path), album, genre
@@ -746,6 +848,10 @@ def route_queue_add():
     title = (data.get("title") or "Unknown title").strip()
     artist = (data.get("artist") or "Unknown artist").strip()
     duration = data.get("duration")
+    # Present when the pick came from the YT Music 'songs' search tier —
+    # its own real album name, straight from the authoritative source,
+    # rather than something download_track() has to go guess afterward.
+    known_album = (data.get("album") or "").strip()
     if not video_id or not url:
         return jsonify({"error": "video_id and url are required"}), 400
 
@@ -778,6 +884,7 @@ def route_queue_add():
             item["title"] = title
             item["artist"] = artist
             item["duration"] = duration
+            item["known_album"] = known_album
             item["status"] = "queued"
         state["queue"].append(item)
         # A track that skipped straight to "ready" (the Navidrome-match
