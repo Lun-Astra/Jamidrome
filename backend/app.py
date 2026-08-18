@@ -102,7 +102,12 @@ def public_view(item, include_stream=False):
     v = {k: item[k] for k in ("id", "video_id", "title", "artist", "thumbnail",
                                "duration", "status", "requested_by", "added_at")}
     if include_stream:
-        v["stream_url"] = f"/stream/{item['id']}"
+        # /api/ prefix matters: nginx only proxies paths under /api/ to this
+        # backend on both ports — everything else falls through to its SPA
+        # catch-all and serves player.html back instead (200 OK, text/html).
+        # A bare "/stream/<id>" here silently handed the <audio> element an
+        # HTML page instead of audio, which is why playback never worked.
+        v["stream_url"] = f"/api/stream/{item['id']}"
     return v
 
 
