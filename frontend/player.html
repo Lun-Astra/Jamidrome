@@ -186,6 +186,10 @@ updateMuteIcon();
 // the outside), show a real button whenever a play() call is rejected so
 // there's always a working way to actually start the sound.
 function tryPlay(){
+  // Defensive: re-attempt resuming the AudioContext on every track change
+  // too, not just once at start — if it ever silently stayed suspended,
+  // this keeps giving it another chance rather than staying silent forever.
+  if(audioCtx && audioCtx.state === 'suspended'){ audioCtx.resume().catch(()=>{}); }
   const p = audio.play();
   const unlock = document.getElementById('audio-unlock');
   if(p && p.then){
@@ -322,23 +326,43 @@ async function revokeInvite(token){
 }
 
 // ── Visualizer ───────────────────────────────────────────────────────────
-// createMediaElementSource reroutes the <audio> element's output through
-// the Web Audio graph — sound only keeps playing if the source is
-// (re)connected all the way to audioCtx.destination, so that connection
-// is exactly as important here as tapping the analyser is.
+// createMediaElementSource irreversibly reroutes the <audio> element's
+// output through the Web Audio graph the moment it's called — there's no
+// going back to plain <audio> output afterward for this element. The
+// previous version chained source -> analyser -> destination as one
+// sequence, so if the analyser step failed for any reason, play() would
+// still resolve "successfully" while the actual sound output was left
+// dangling with nowhere to go: silent, with no visible error anywhere.
+//
+// Fixed topology: connect source -> destination FIRST, on its own, as the
+// one connection that actually has to work for sound to exist. The
+// analyser is a separate, parallel tap off the same source — it only needs
+// to *receive* audio to answer getByteFrequencyData(), not to also be
+// wired into the output path — so if setting it up fails, sound is
+// completely unaffected either way.
 let audioCtx = null, analyser = null, freqData = null;
 function setupAudioGraph(){
   if(audioCtx) return;
+  let source;
   try{
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const source = audioCtx.createMediaElementSource(audio);
+    source = audioCtx.createMediaElementSource(audio);
+    source.connect(audioCtx.destination);
+  }catch(e){
+    console.warn('[jam] Web Audio unavailable — falling back to plain <audio> output:', e);
+    audioCtx = null;
+    return;
+  }
+  try{
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 128;
     source.connect(analyser);
-    analyser.connect(audioCtx.destination);
     freqData = new Uint8Array(analyser.frequencyBinCount);
     requestAnimationFrame(drawVisualizer);
-  }catch(e){ console.warn('[jam] visualizer unavailable:', e); }
+  }catch(e){
+    console.warn('[jam] visualizer unavailable:', e);
+    analyser = null;
+  }
 }
 
 function drawVisualizer(){

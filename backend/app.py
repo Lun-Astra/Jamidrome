@@ -1,4 +1,5 @@
-import glob, json, os, re, secrets, shlex, subprocess, threading, time, uuid
+import difflib, glob, json, os, re, secrets, shlex, subprocess, threading, time, uuid
+import requests as http
 from flask import Flask, jsonify, request, send_file, abort, redirect
 from flask_cors import CORS
 
@@ -103,6 +104,96 @@ def public_view(item, include_stream=False):
     if include_stream:
         v["stream_url"] = f"/stream/{item['id']}"
     return v
+
+
+# ─── Navidrome duplicate check ──────────────────────────────────────────────
+# Title/artist matching adapted from Spotidrome's own candidate-vetting
+# logic (same tolerances) — not called into at runtime (Jamidrome stays a
+# standalone app), just the same proven approach re-implemented here so a
+# jam request doesn't trigger a redundant download of a track that's
+# already sitting in the library under its properly-tagged name.
+
+def _normalize_title(s):
+    s = (s or "").lower()
+    s = re.sub(r"\(feat\.?[^)]*\)|\[feat\.?[^\]]*\]", "", s)
+    s = re.sub(r"\((remaster(ed)?[^)]*|official[^)]*|lyric[^)]*|audio)\)", "", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _title_close_enough(candidate_title, expected_title):
+    cand_n = _normalize_title(candidate_title)
+    exp_n = _normalize_title(expected_title)
+    if not exp_n or not cand_n:
+        return False
+    if exp_n in cand_n or cand_n in exp_n:
+        return True
+    if difflib.SequenceMatcher(None, cand_n, exp_n).ratio() >= 0.72:
+        return True
+    words = [w for w in exp_n.split() if len(w) > 2]
+    return bool(words) and sum(1 for w in words if w in cand_n) / len(words) >= 0.6
+
+def _artist_close_enough(candidate_artist, expected_artist):
+    """candidate_artist is Navidrome's clean tagged artist; expected_artist
+    is whatever came off YouTube (channel/uploader name), which is often
+    noisier — e.g. "Bonnie Tyler Official" or "Bonnie Tyler - Topic" for a
+    clean "Bonnie Tyler" tag. Checked as word-overlap in both directions
+    rather than requiring either string to contain the other whole, since
+    neither side is reliably the "clean" one to substring-match against."""
+    cand = re.sub(r"\s*-\s*topic$", "", (candidate_artist or "").lower()).strip()
+    exp = (expected_artist or "").lower().strip()
+    if not cand or not exp:
+        return not cand and not exp
+    if cand in exp or exp in cand:
+        return True
+    cand_words = {w for w in re.split(r"[^\w]+", cand) if len(w) > 2}
+    exp_words = {w for w in re.split(r"[^\w]+", exp) if len(w) > 2}
+    if not cand_words or not exp_words:
+        return False
+    smaller = min(len(cand_words), len(exp_words))
+    return len(cand_words & exp_words) / smaller >= 0.6
+
+def _duration_close_enough(candidate_sec, expected_sec, pct=0.15, floor=15):
+    if not expected_sec:
+        return True  # nothing to compare against — don't penalize
+    if not candidate_sec:
+        return False
+    return abs(candidate_sec - expected_sec) <= max(floor, expected_sec * pct)
+
+def check_navidrome_duplicate(title, artist, duration_sec):
+    """Search Navidrome's own library via the Subsonic API for a song that's
+    already a good match for this request. Returns the matching {title,
+    artist} dict if found, else None. Best-effort: any failure (Navidrome
+    unreachable, not configured, etc.) is treated as 'no match found' —
+    this check existing is a nice-to-have, not something that should ever
+    block a request from going through."""
+    if not (NAVIDROME_URL and NAVIDROME_USER):
+        return None
+    query = _normalize_title(title)[:60] or (title or "")[:60]
+    try:
+        resp = http.get(f"{NAVIDROME_URL}/rest/search3", params={
+            "query": query, "songCount": 20, "albumCount": 0, "artistCount": 0,
+            "u": NAVIDROME_USER, "p": NAVIDROME_PASSWORD, "v": "1.16.1",
+            "c": "jamidrome", "f": "json",
+        }, timeout=10)
+        resp.raise_for_status()
+        songs = (resp.json().get("subsonic-response", {})
+                              .get("searchResult3", {}).get("song", []))
+    except Exception:
+        return None
+
+    for song in songs:
+        cand_title = song.get("title", "")
+        cand_artist = song.get("artist", "")
+        cand_duration = song.get("duration")
+        if not _title_close_enough(cand_title, title):
+            continue
+        if not _artist_close_enough(cand_artist, artist):
+            continue
+        if not _duration_close_enough(cand_duration, duration_sec):
+            continue
+        return {"title": cand_title, "artist": cand_artist}
+    return None
 
 
 # ─── yt-dlp search & download ───────────────────────────────────────────────
@@ -211,7 +302,6 @@ def sync_to_navidrome_bg(item):
                      item["local_path"], dest]
         subprocess.run(rsync_cmd, capture_output=True, timeout=120)
         if NAVIDROME_URL and NAVIDROME_USER:
-            import requests as http
             http.put(f"{NAVIDROME_URL}/api/scanner/trigger",
                       auth=(NAVIDROME_USER, NAVIDROME_PASSWORD), timeout=15)
     except Exception as e:
@@ -359,8 +449,17 @@ def route_queue_add():
     video_id = (data.get("video_id") or "").strip()
     url = (data.get("url") or "").strip()
     title = (data.get("title") or "Unknown title").strip()
+    artist = (data.get("artist") or "Unknown artist").strip()
+    duration = data.get("duration")
     if not video_id or not url:
         return jsonify({"error": "video_id and url are required"}), 400
+
+    # Checked outside state_lock — it's a Navidrome network call, not
+    # shared in-memory state, and shouldn't hold up every other request
+    # while it's in flight.
+    match = check_navidrome_duplicate(title, artist, duration)
+    if match:
+        return jsonify({"error": f"Already in your library as \"{match['title']}\" by {match['artist']}"}), 409
 
     with state_lock:
         active_ids = {i["video_id"] for i in state["queue"] if i["status"] in ("queued", "downloading", "ready", "playing")}
@@ -369,9 +468,7 @@ def route_queue_add():
 
         item = {
             "id": uuid.uuid4().hex[:12],
-            "video_id": video_id, "url": url, "title": title,
-            "artist": (data.get("artist") or "Unknown artist").strip(),
-            "duration": data.get("duration"),
+            "video_id": video_id, "url": url, "title": title, "artist": artist, "duration": duration,
             "thumbnail": data.get("thumbnail") or "",
             "requested_by": (data.get("requested_by") or "Anonymous").strip()[:40] or "Anonymous",
             "status": "queued", "added_at": time.time(),

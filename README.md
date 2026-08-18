@@ -30,8 +30,13 @@ Both talk to the same Flask backend, which:
    library (under a `Jam/` folder) and triggers a scan, purely so the
    track ends up archived permanently. This never blocks or delays
    playback.
-4. Refuses to add a song that's already sitting in the queue (or
-   currently playing) a second time.
+4. Refuses to add a song that's already sitting in the queue (or currently
+   playing) a second time — and separately, checks Navidrome's own library
+   (via its Subsonic API) for a track that's already a good match by
+   title/artist/duration, using the same matching tolerances Spotidrome
+   uses to vet its own download candidates, so requesting something
+   that's already properly in the library doesn't trigger a redundant
+   download.
 5. Auto-advances the queue when a track ends — driven by the player page's
    own `ended` event, with a server-side timer as a fallback in case the
    player page gets closed or the browser hiccups, so the jam doesn't get
