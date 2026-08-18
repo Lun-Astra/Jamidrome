@@ -134,7 +134,15 @@ body::before{content:'';position:fixed;inset:0;
 <script>
 const API = '/api';
 const audio = document.getElementById('audio');
-document.getElementById('host-hint').textContent = `${location.hostname}:9998`;
+(async () => {
+  const hint = document.getElementById('host-hint');
+  hint.textContent = `${location.hostname}:9998`; // fallback until /config resolves (or if it fails)
+  try{
+    const r = await fetch(`${API}/config`);
+    const d = await r.json();
+    if(d.request_page_url) hint.textContent = new URL(d.request_page_url).host;
+  }catch(e){}
+})();
 
 function startJam(){
   document.getElementById('overlay').style.display = 'none';
@@ -222,7 +230,9 @@ async function generateInvite(){
       body: JSON.stringify({ttl_seconds})});
     const d = await r.json();
     if(!r.ok){ alert(d.error || 'Could not create link'); return; }
-    const link = `${location.protocol}//${location.hostname}:9999${d.path}`;
+    // location.origin reflects however this page was actually reached —
+    // raw :9999, or a reverse-proxied hostname with no port at all.
+    const link = `${location.origin}${d.path}`;
     document.getElementById('im-link').value = link;
     document.getElementById('im-link-row').style.display = 'flex';
     refreshInviteList();

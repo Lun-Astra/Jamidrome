@@ -41,7 +41,11 @@ MAX_HISTORY         = 50
 ADVANCE_BUFFER_SEC   = 5     # grace period added on top of a track's own duration
                              # before the server auto-advances without a client signal
 SEARCH_RESULT_COUNT  = 10
-REQUEST_PAGE_PORT    = 9998
+# Set when the request/player pages sit behind a reverse proxy on separate
+# hostnames (e.g. jam.example.com / aanvragenjam.example.com) rather than
+# being reached directly on :9999/:9998 — there's no way to derive one
+# hostname from the other in that setup, so it has to be configured.
+REQUEST_PAGE_URL     = os.environ.get("REQUEST_PAGE_URL", "").rstrip("/")
 MIN_INVITE_TTL_SEC   = 60
 MAX_INVITE_TTL_SEC   = 7 * 24 * 3600
 
@@ -296,9 +300,9 @@ def watchdog_loop():
 
 
 # ─── Invite links ────────────────────────────────────────────────────────────
-# Minted from the player page (:9999) so the host can hand out a link that
-# drops people straight onto the request page (:9998) — one row of state per
-# generated link, each independently timed out.
+# Minted from the player page so the host can hand out a link that drops
+# people straight onto the request page — one row of state per generated
+# link, each independently timed out.
 
 def _prune_expired_invites():
     """Must be called with state_lock held."""
@@ -309,16 +313,25 @@ def _prune_expired_invites():
 
 
 def _request_page_url():
+    if REQUEST_PAGE_URL:
+        return REQUEST_PAGE_URL + "/"
+    # Fallback for a direct-port setup with no reverse proxy in front (no
+    # REQUEST_PAGE_URL configured): derive the request page's address by
+    # swapping :9999 for :9998 on whatever host the link was opened from.
     # $http_host (forwarded below as X-Forwarded-Host) preserves whatever
     # host:port the browser actually sent, unlike nginx's own $host which
-    # strips the port — needed here since the link has to swap :9999 for
-    # :9998 on whatever hostname/IP someone is actually browsing from.
+    # strips the port.
     host_hdr = request.headers.get("X-Forwarded-Host") or request.host or ""
     hostname = host_hdr.split(":")[0] or "localhost"
-    return f"http://{hostname}:{REQUEST_PAGE_PORT}/"
+    return f"http://{hostname}:9998/"
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
+
+@app.route("/config")
+def route_config():
+    return jsonify({"request_page_url": REQUEST_PAGE_URL or None})
+
 
 @app.route("/search")
 def route_search():
