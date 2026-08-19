@@ -81,7 +81,9 @@ copy/share directly. Anyone who opens it (by scanning or by the link)
 gets redirected straight to the request page. Each Generate mints a brand
 new, independent link (generating another one doesn't invalidate earlier
 ones), and a link is reusable by anyone who has it until it expires or
-you revoke it from the same modal. There's no per-person limit or
+you revoke it from the same modal. Any link still listed under Active
+Links can be reopened (🔗) to bring its link/QR back up again, without
+needing to generate a new one. There's no per-person limit or
 accounts — it's a "whoever has the link" model, same trust level as the
 rest of the app.
 

@@ -88,7 +88,8 @@ body::before{content:'';position:fixed;inset:0;
 .im-item{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:11.5px}
 .im-item .exp{color:var(--text3);flex:1}
 .im-item button{background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px}
-.im-item button:hover{color:#f87171}
+.im-item button.im-revoke:hover{color:#f87171}
+.im-item button.im-reopen:hover{color:var(--sp)}
 .im-empty{color:var(--text3);font-size:12px;padding:6px 2px}
 </style>
 </head>
@@ -291,9 +292,16 @@ function render(d){
       audio.addEventListener('loadedmetadata', function seekOnce(){
         audio.currentTime = elapsed;
       }, {once: true});
-      userPaused = false;
-      updatePauseIcon();
-      tryPlay();
+      // userPaused is deliberately NOT reset here. It used to be, which
+      // meant a manual pause only ever lasted until the shared queue's
+      // next track change — the moment anyone (or the watchdog) advanced
+      // the queue, every paused session silently started playing again on
+      // its own. That's not an independent per-session pause, it's a
+      // pause that un-pauses itself; this is the actual bug behind
+      // "individual sessions not working". A paused session now stays
+      // paused (on whatever the current track now is) until the person
+      // watching it explicitly presses Play again.
+      if(!userPaused) tryPlay();
     }
     if(!userPaused){
       const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
@@ -346,6 +354,16 @@ function openInvite(){
 }
 function closeInvite(){ document.getElementById('invite-modal').classList.remove('show'); }
 
+function showInviteLink(path){
+  // location.origin reflects however this page was actually reached —
+  // raw :9999, or a reverse-proxied hostname with no port at all.
+  const link = `${location.origin}${path}`;
+  document.getElementById('im-link').value = link;
+  document.getElementById('im-link-row').style.display = 'flex';
+  document.getElementById('im-qr').src = `${API}/invite/qr?data=${encodeURIComponent(link)}`;
+  document.getElementById('im-qr-wrap').style.display = 'flex';
+}
+
 async function generateInvite(){
   const ttl_seconds = parseInt(document.getElementById('ttl-select').value, 10);
   try{
@@ -353,15 +371,16 @@ async function generateInvite(){
       body: JSON.stringify({ttl_seconds})});
     const d = await r.json();
     if(!r.ok){ alert(d.error || 'Could not create link'); return; }
-    // location.origin reflects however this page was actually reached —
-    // raw :9999, or a reverse-proxied hostname with no port at all.
-    const link = `${location.origin}${d.path}`;
-    document.getElementById('im-link').value = link;
-    document.getElementById('im-link-row').style.display = 'flex';
-    document.getElementById('im-qr').src = `${API}/invite/qr?data=${encodeURIComponent(link)}`;
-    document.getElementById('im-qr-wrap').style.display = 'flex';
+    showInviteLink(d.path);
     refreshInviteList();
   }catch(e){ alert('Failed: ' + e.message); }
+}
+
+// Previously generated links only ever showed their link/QR once, right
+// after being created — after that they were reduced to a bare truncated
+// token in the Active Links list with no way back to the actual link.
+function reopenInvite(token){
+  showInviteLink(`/invite/${token}`);
 }
 
 function copyInvite(){
@@ -380,7 +399,8 @@ async function refreshInviteList(){
     list.innerHTML = d.invites.map(inv => `
       <div class="im-item">
         <span class="exp">…${esc(inv.token.slice(-6))} · ${fmtRemaining(inv.expires_at)}</span>
-        <button onclick="revokeInvite('${inv.token}')" title="Revoke">✕</button>
+        <button class="im-reopen" onclick="reopenInvite('${inv.token}')" title="Show link &amp; QR again">🔗</button>
+        <button class="im-revoke" onclick="revokeInvite('${inv.token}')" title="Revoke">✕</button>
       </div>`).join('');
   }catch(e){}
 }
