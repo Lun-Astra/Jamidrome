@@ -76,7 +76,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 #          one does not invalidate earlier ones) and reusable by anyone who
 #          has it until it expires.
 state_lock = threading.Lock()
-state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None, "invites": {}}
+state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None, "invites": {},
+         "paused": False, "pause_started_at": None}
 
 
 def load_state():
@@ -96,6 +97,8 @@ def load_state():
     # any open player page is gone. Let the worker re-promote once ready.
     state["now_playing_id"] = None
     state["playback_started_at"] = None
+    state["paused"] = False
+    state["pause_started_at"] = None
     for item in state["queue"]:
         if item.get("status") == "playing":
             item["status"] = "ready"
@@ -712,14 +715,35 @@ def _promote_next_if_idle():
         state["playback_started_at"] = time.time()
 
 
+def pause_playback():
+    with state_lock:
+        if state["now_playing_id"] and not state["paused"]:
+            state["paused"] = True
+            state["pause_started_at"] = time.time()
+            save_state()
+
+def resume_playback():
+    with state_lock:
+        if state["paused"] and state["pause_started_at"] is not None:
+            paused_for = time.time() - state["pause_started_at"]
+            if state["playback_started_at"] is not None:
+                # Shifts the "clock" forward by however long it was paused,
+                # so elapsed = now - playback_started_at keeps meaning
+                # "how much of the track has actually played", not
+                # counting the paused interval as elapsed playback time.
+                state["playback_started_at"] += paused_for
+            state["paused"] = False
+            state["pause_started_at"] = None
+            save_state()
+
+
 def advance(expected_id=None):
     """Finish whatever's currently playing and promote the next ready item.
     If expected_id is given, only acts when it still matches the current
-    now_playing_id — with multiple independent player sessions now allowed
-    (each browser has its own local play/pause state, all following the
-    same shared queue), more than one session can legitimately reach
-    'ended' on the same track around the same real moment and each try to
-    advance; without this guard that would skip two tracks instead of one."""
+    now_playing_id — a harmless no-op guard against a duplicate/retried
+    advance call (a flaky network retry, the watchdog and a client signal
+    landing at nearly the same moment, etc.) skipping two tracks instead
+    of one."""
     with state_lock:
         if expected_id is not None and state["now_playing_id"] != expected_id:
             return
@@ -740,6 +764,11 @@ def advance(expected_id=None):
                     threading.Timer(30, _cleanup_downloaded_files, args=(cur["id"],)).start()
         state["now_playing_id"] = None
         state["playback_started_at"] = None
+        # A pause is tied to a specific track's timeline — moving to a new
+        # one (skip, or the current one simply ending) means whatever was
+        # paused no longer applies.
+        state["paused"] = False
+        state["pause_started_at"] = None
         _promote_next_if_idle()
         save_state()
 
@@ -781,9 +810,10 @@ def watchdog_loop():
         with state_lock:
             cur_id = state["now_playing_id"]
             started = state["playback_started_at"]
+            paused = state["paused"]
             cur = find_item(cur_id) if cur_id else None
             duration = (cur or {}).get("duration") or 0
-        if cur and started and time.time() - started > duration + ADVANCE_BUFFER_SEC:
+        if cur and started and not paused and time.time() - started > duration + ADVANCE_BUFFER_SEC:
             advance()
 
 
@@ -836,6 +866,8 @@ def route_queue_get():
         return jsonify({
             "now_playing": public_view(now_playing, include_stream=True) if now_playing else None,
             "playback_started_at": state["playback_started_at"],
+            "paused": state["paused"],
+            "pause_started_at": state["pause_started_at"],
             "queue": [public_view(i) for i in state["queue"] if i["status"] != "playing"],
             "history": [public_view(i) for i in state["history"][-10:]],
         })
@@ -916,6 +948,8 @@ def route_player_state():
         return jsonify({
             "now_playing": public_view(now_playing, include_stream=True) if now_playing else None,
             "playback_started_at": state["playback_started_at"],
+            "paused": state["paused"],
+            "pause_started_at": state["pause_started_at"],
             "up_next": [public_view(i) for i in state["queue"] if i["status"] != "playing"][:10],
         })
 
@@ -924,6 +958,18 @@ def route_player_state():
 def route_player_advance():
     data = request.json or {}
     advance(expected_id=data.get("expected_id"))
+    return jsonify({"ok": True})
+
+
+@app.route("/player/pause", methods=["POST"])
+def route_player_pause():
+    pause_playback()
+    return jsonify({"ok": True})
+
+
+@app.route("/player/resume", methods=["POST"])
+def route_player_resume():
+    resume_playback()
     return jsonify({"ok": True})
 
 

@@ -219,27 +219,21 @@ function tryPlay(){
   }
 }
 
-// ── Pause (local to this browser only) ──────────────────────────────────
-// Each open player page is its own independent session now — pausing here
-// doesn't touch the shared queue or affect anyone else watching. Resuming
-// jumps back to wherever the shared timeline currently is, rather than
-// the stale position from whenever this browser paused.
-let userPaused = false;
+// ── Pause (global — one shared jam, same state for everyone watching) ───
+// There is exactly one real queue/player; pausing here pauses it for
+// every open player page, and the button always reflects the server's
+// actual state (polled), not anything tracked locally per-browser.
+let jamPaused = false;
 function updatePauseIcon(){
-  document.getElementById('pause-btn').textContent = userPaused ? '▶ Play' : '⏸ Pause';
+  document.getElementById('pause-btn').textContent = jamPaused ? '▶ Play' : '⏸ Pause';
 }
 function togglePause(){
-  if(userPaused){
-    userPaused = false;
-    if(lastPlaybackStartedAt && lastDuration){
-      const elapsed = Date.now()/1000 - lastPlaybackStartedAt;
-      if(elapsed < lastDuration) audio.currentTime = elapsed;
-    }
-    tryPlay();
-  } else {
-    userPaused = true;
-    audio.pause();
-  }
+  fetch(`${API}/player/${jamPaused ? 'resume' : 'pause'}`, {method: 'POST'});
+  // Acted on locally right away for a responsive click — the next poll
+  // (within ~1s) reconciles this with the real server state regardless,
+  // including for every *other* open player page watching the same jam.
+  jamPaused = !jamPaused;
+  if(jamPaused) audio.pause(); else tryPlay();
   updatePauseIcon();
 }
 
@@ -273,11 +267,6 @@ async function poll(){
   setTimeout(poll, 1000);
 }
 
-// Tracked so the pause button can resync to wherever the shared timeline
-// currently is when resuming, and so a page reload mid-track picks up
-// from the right position instead of restarting at 0.
-let lastPlaybackStartedAt = null, lastDuration = null;
-
 function render(d){
   const np = d.now_playing;
   document.getElementById('playing-view').style.display = np ? 'flex' : 'none';
@@ -286,8 +275,8 @@ function render(d){
   document.getElementById('pause-btn').style.display = np ? 'block' : 'none';
 
   if(np){
-    lastPlaybackStartedAt = d.playback_started_at;
-    lastDuration = np.duration;
+    jamPaused = !!d.paused;
+    updatePauseIcon();
     if(np.id !== currentId){
       currentId = np.id;
       document.getElementById('art').src = np.thumbnail || '';
@@ -302,27 +291,30 @@ function render(d){
       audio.src = np.stream_url;
       audio.addEventListener('loadedmetadata', function seekOnce(){
         audio.currentTime = elapsed;
+        if(!jamPaused) tryPlay();
       }, {once: true});
-      // userPaused is deliberately NOT reset here. It used to be, which
-      // meant a manual pause only ever lasted until the shared queue's
-      // next track change — the moment anyone (or the watchdog) advanced
-      // the queue, every paused session silently started playing again on
-      // its own. That's not an independent per-session pause, it's a
-      // pause that un-pauses itself; this is the actual bug behind
-      // "individual sessions not working". A paused session now stays
-      // paused (on whatever the current track now is) until the person
-      // watching it explicitly presses Play again.
-      if(!userPaused) tryPlay();
+    } else if(jamPaused && !audio.paused){
+      // Someone else's session (or this one, a moment ago) paused the
+      // shared jam — bring this <audio> element in line with that.
+      audio.pause();
+    } else if(!jamPaused && audio.paused && audio.src){
+      tryPlay();
     }
-    if(!userPaused){
-      const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
-      const pct = np.duration ? Math.min(100, elapsed/np.duration*100) : 0;
-      document.getElementById('bar-fill').style.width = pct + '%';
-      document.getElementById('t-elapsed').textContent = fmt(elapsed);
-    }
+
+    // While paused, elapsed must stay pinned at the instant pausing
+    // happened rather than keep counting up in real time — the server
+    // only folds the paused duration into playback_started_at once
+    // resumed, so until then, now - playback_started_at would otherwise
+    // just keep growing even though nothing is actually still playing.
+    const elapsed = (d.paused && d.pause_started_at)
+      ? (d.pause_started_at - d.playback_started_at)
+      : (d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0);
+    const pct = np.duration ? Math.min(100, elapsed/np.duration*100) : 0;
+    document.getElementById('bar-fill').style.width = pct + '%';
+    document.getElementById('t-elapsed').textContent = fmt(elapsed);
   } else {
     currentId = null;
-    userPaused = false;
+    jamPaused = false;
     audio.pause();
     audio.removeAttribute('src');
   }

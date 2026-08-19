@@ -22,10 +22,12 @@ instead of syncing whole playlists.
   at after downloading. Plain YouTube search only fills in whatever's left
   (deduped), so covers/live versions are still findable, just never
   crowding out the real thing.
-- **Player** (port `9999`). Open this once on whatever's connected to the
-  speakers (a TV, an old laptop, whatever) and leave it open. It has no
-  input of its own beyond a skip button — it just plays the queue,
-  automatically, as songs become ready.
+- **Player** (port `9999`). Open this once, on whatever's connected to the
+  speakers (a TV, an old laptop, whatever), and leave it open — this is
+  the one real jam, playing for the room. It plays the queue automatically
+  as songs become ready, with **⏭ Skip** and a real **⏸ Pause** (pausing
+  affects the shared jam for everyone watching, same as pausing a normal
+  music player — it's not a per-browser thing).
 
 Both ports are meant to sit behind your own reverse proxy rather than be
 opened directly — see **Behind a reverse proxy** below.
@@ -57,19 +59,16 @@ Both talk to the same Flask backend, which:
    it just streams straight from the existing Navidrome copy instead of
    downloading a redundant new one, skipping the download step entirely.
 7. Auto-advances the queue when a track ends — driven by the player page's
-   own `ended` event, with a server-side timer as a fallback in case every
-   player session gets closed or the browser hiccups, so the jam doesn't
-   get stuck waiting for a signal that may never arrive. Idempotent by
-   design: several independent player sessions can be open at once (see
-   below), and might all reach 'ended' on the same track around the same
-   moment — only the first one actually advances the queue.
+   own `ended` event, with a server-side timer as a fallback in case the
+   player page gets closed or the browser hiccups, so the jam doesn't get
+   stuck waiting for a signal that may never arrive.
 
-The player page is multi-session: open it in as many browsers/tabs as you
-want (different rooms, everyone's own phone, whatever) — each one plays the
-shared queue independently, with its own **⏸ Pause** you control without
-affecting anyone else's. Reloading the page (or resuming from pause) picks
-up wherever the shared timeline currently is rather than restarting the
-track from 0:00.
+Pause is a real, global pause on the one shared jam — not a per-browser
+thing. If you happen to have the player page open in more than one place
+at once, they all show (and play) the exact same state; there's no
+"individual session" behind any of it. Reloading the page (or resuming
+from pause) picks up wherever the shared timeline currently is rather
+than restarting the track from 0:00.
 
 ## Inviting people
 
