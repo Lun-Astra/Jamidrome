@@ -1,4 +1,4 @@
-import difflib, glob, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, uuid
+import difflib, glob, io, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 import requests as http
 from flask import Flask, jsonify, request, send_file, abort, redirect, Response
@@ -8,6 +8,7 @@ from spotipy.oauth2 import SpotifyOAuth
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TCON, COMM, error as ID3Error
 from ytmusicapi import YTMusic
+import qrcode
 
 app = Flask(__name__)
 CORS(app)
@@ -998,6 +999,20 @@ def route_invite_revoke(token):
         state["invites"].pop(token, None)
         save_state()
     return jsonify({"ok": True})
+
+
+@app.route("/invite/qr")
+def route_invite_qr():
+    """Renders a QR code PNG for whatever URL the frontend already built
+    (it already knows its own real address — location.origin — so there's
+    no need to reconstruct or guess a URL server-side here)."""
+    data = request.args.get("data", "")
+    if not data:
+        abort(400)
+    img = qrcode.make(data, box_size=8, border=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(buf.getvalue(), mimetype="image/png")
 
 
 @app.route("/invite/<token>")

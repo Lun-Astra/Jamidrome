@@ -74,13 +74,16 @@ track from 0:00.
 ## Inviting people
 
 The player page has a **🔗 Invite** button (top-left). Pick how long the
-link should stay valid (15 minutes up to 24 hours), hit Generate, and share
-the resulting `<player-url>/invite/<token>` link — anyone who opens it gets
-redirected straight to the request page. Each Generate mints a brand new,
-independent link (generating another one doesn't invalidate earlier ones),
-and a link is reusable by anyone who has it until it expires or you revoke
-it from the same modal. There's no per-person limit or accounts — it's a
-"whoever has the link" model, same trust level as the rest of the app.
+link should stay valid (15 minutes up to 24 hours) and hit Generate — it
+shows an actual scannable QR code right there on screen (point a phone
+camera at it), plus the same `<player-url>/invite/<token>` link as text to
+copy/share directly. Anyone who opens it (by scanning or by the link)
+gets redirected straight to the request page. Each Generate mints a brand
+new, independent link (generating another one doesn't invalidate earlier
+ones), and a link is reusable by anyone who has it until it expires or
+you revoke it from the same modal. There's no per-person limit or
+accounts — it's a "whoever has the link" model, same trust level as the
+rest of the app.
 
 ## Behind a reverse proxy
 

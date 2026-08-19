@@ -60,14 +60,14 @@ body::before{content:'';position:fixed;inset:0;
 .vol-ctrl button{background:none;border:none;color:var(--text2);font-size:14px;cursor:pointer;line-height:1}
 .vol-ctrl button:hover{color:var(--text)}
 .vol-ctrl input[type=range]{width:90px;accent-color:var(--sp);cursor:pointer}
-#invite-btn{position:fixed;top:22px;left:28px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;z-index:5}
+#invite-btn{position:fixed;top:60px;left:28px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;z-index:5}
 #invite-btn:hover{color:var(--text)}
 
 #audio-unlock{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);display:none;
   background:var(--sp);color:#06210f;border:none;border-radius:24px;padding:12px 24px;
   font-size:14px;font-weight:700;cursor:pointer;z-index:15;box-shadow:0 10px 30px rgba(0,0,0,.4)}
 
-#viz{width:min(70vw,520px);height:64px;margin:18px auto 0;display:block}
+#viz{width:min(70vw,520px);height:90px;margin:18px auto 0;display:block}
 
 #invite-modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:20;display:none;align-items:center;justify-content:center}
 #invite-modal.show{display:flex}
@@ -78,6 +78,8 @@ body::before{content:'';position:fixed;inset:0;
 .im-row{display:flex;gap:8px;margin-bottom:10px}
 .im-row select{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 10px;color:var(--text);font-size:13px;outline:none}
 .im-row button{background:var(--sp);color:#06210f;border:none;border-radius:8px;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap}
+.im-qr-wrap{display:none;justify-content:center;padding:14px 0 4px}
+.im-qr-wrap img{width:180px;height:180px;border-radius:10px;background:#fff;padding:10px}
 .im-link-row{display:none;gap:6px;margin-bottom:16px}
 .im-link-row input{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 10px;color:var(--text2);font-size:12px;outline:none}
 .im-link-row button{background:var(--bg4);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:0 12px;font-size:12px;cursor:pointer}
@@ -123,6 +125,9 @@ body::before{content:'';position:fixed;inset:0;
       </select>
       <button onclick="generateInvite()">Generate</button>
     </div>
+    <div class="im-qr-wrap" id="im-qr-wrap">
+      <img id="im-qr" alt="Scan to join">
+    </div>
     <div class="im-link-row" id="im-link-row">
       <input id="im-link" readonly>
       <button onclick="copyInvite()">Copy</button>
@@ -142,7 +147,7 @@ body::before{content:'';position:fixed;inset:0;
       <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
       <div class="times"><span id="t-elapsed">0:00</span><span id="t-total">0:00</span></div>
     </div>
-    <canvas id="viz" width="520" height="64"></canvas>
+    <canvas id="viz" width="520" height="90"></canvas>
   </div>
   <div id="idle-view" class="idle">
     <div class="big">Waiting for requests…</div>
@@ -336,6 +341,7 @@ function fmtRemaining(expiresAt){
 function openInvite(){
   document.getElementById('invite-modal').classList.add('show');
   document.getElementById('im-link-row').style.display = 'none';
+  document.getElementById('im-qr-wrap').style.display = 'none';
   refreshInviteList();
 }
 function closeInvite(){ document.getElementById('invite-modal').classList.remove('show'); }
@@ -352,6 +358,8 @@ async function generateInvite(){
     const link = `${location.origin}${d.path}`;
     document.getElementById('im-link').value = link;
     document.getElementById('im-link-row').style.display = 'flex';
+    document.getElementById('im-qr').src = `${API}/invite/qr?data=${encodeURIComponent(link)}`;
+    document.getElementById('im-qr-wrap').style.display = 'flex';
     refreshInviteList();
   }catch(e){ alert('Failed: ' + e.message); }
 }
@@ -431,6 +439,13 @@ function setupAudioGraph(){
   }
 }
 
+// Peak-hold caps (rise instantly, fall slowly under "gravity") and a
+// fading reflection below the baseline are the two most recognizable
+// signature touches of the classic hi-fi/audioMotion-style spectrum
+// analyzer look (the same style Feishin's own visualizer is built on) —
+// a plain bar sweep reads as a generic bar chart without them.
+let peaks = null;
+
 function drawVisualizer(){
   requestAnimationFrame(drawVisualizer);
   const canvas = document.getElementById('viz');
@@ -439,6 +454,7 @@ function drawVisualizer(){
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
+
   // Mirrored outward from the center (low frequencies innermost, high
   // frequencies at the outer edges) rather than a plain left-to-right
   // sweep — a left-to-right layout reliably looks lopsided in practice
@@ -446,17 +462,40 @@ function drawVisualizer(){
   // the whole thing look tilted toward one side regardless of how well
   // the canvas itself is centered on the page.
   const half = Math.max(1, Math.floor(freqData.length / 2));
+  if(!peaks || peaks.length !== half) peaks = new Float32Array(half);
   const barWidth = (w / 2) / half;
-  const center = w / 2;
+  const bw = Math.max(1, barWidth - 1);
+  const baseline = h * 0.62;   // bars occupy the top ~62%...
+  const reflH = h - baseline;  // ...and fade into a reflection below
+
   for(let i = 0; i < half; i++){
-    const barHeight = (freqData[i] / 255) * h;
-    const grad = ctx.createLinearGradient(0, h - barHeight, 0, h);
+    const ratio = freqData[i] / 255;
+    const barHeight = ratio * baseline;
+    peaks[i] = Math.max(barHeight, peaks[i] - baseline * 0.02); // gravity
+
+    const grad = ctx.createLinearGradient(0, baseline - barHeight, 0, baseline);
     grad.addColorStop(0, '#1ed760');
     grad.addColorStop(1, '#8b5cf6');
     ctx.fillStyle = grad;
-    const bw = Math.max(1, barWidth - 1);
-    ctx.fillRect(center + i * barWidth, h - barHeight, bw, barHeight);
-    ctx.fillRect(center - (i + 1) * barWidth, h - barHeight, bw, barHeight);
+    for(const x of [w / 2 + i * barWidth, w / 2 - (i + 1) * barWidth]){
+      ctx.beginPath();
+      if(ctx.roundRect) ctx.roundRect(x, baseline - barHeight, bw, barHeight, [2, 2, 0, 0]);
+      else ctx.rect(x, baseline - barHeight, bw, barHeight);
+      ctx.fill();
+
+      // Peak-hold cap
+      ctx.fillStyle = 'rgba(255,255,255,.85)';
+      ctx.fillRect(x, baseline - peaks[i] - 2, bw, 2);
+      ctx.fillStyle = grad;
+
+      // Reflection: same bar mirrored below the baseline, fading out
+      const rh = Math.min(barHeight, reflH);
+      const rGrad = ctx.createLinearGradient(0, baseline, 0, baseline + rh);
+      rGrad.addColorStop(0, 'rgba(30,215,96,.28)');
+      rGrad.addColorStop(1, 'rgba(139,92,246,0)');
+      ctx.fillStyle = rGrad;
+      ctx.fillRect(x, baseline, bw, rh);
+    }
   }
 }
 </script>
