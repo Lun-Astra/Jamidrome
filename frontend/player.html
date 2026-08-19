@@ -452,7 +452,11 @@ function setupAudioGraph(){
   }
   try{
     analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 128;
+    // 2048 gives 1024 underlying frequency bins — plenty of raw resolution
+    // to bucket log-scale below, versus the 64 bins used previously (that
+    // was fine for a linear sweep, but a log scale needs real resolution
+    // to draw from in the upper octaves).
+    analyser.fftSize = 2048;
     // getByteFrequencyData maps [minDecibels, maxDecibels] linearly onto
     // 0-255. The Web Audio defaults (-100 to -30 dBFS) put "max height" at
     // a level normal music clears constantly, even in its quiet passages
@@ -464,11 +468,40 @@ function setupAudioGraph(){
     analyser.maxDecibels = -10;
     source.connect(analyser);
     freqData = new Uint8Array(analyser.frequencyBinCount);
+    barBins = computeBarBins();
     requestAnimationFrame(drawVisualizer);
   }catch(e){
     console.warn('[jam] visualizer unavailable:', e);
     analyser = null;
   }
+}
+
+// Real spectrum analyzers (audioMotion — the library Feishin's own
+// visualizer is built on — included, log scale is its documented default
+// "recommended for musical applications") space bars by musical
+// octave/tone, not by raw linear FFT bin — a linear layout crams almost
+// all the visually-interesting range into the first few bars, since bass
+// dominates a linear frequency axis, leaving everything above a couple
+// kHz nearly flat. Log spacing is what makes a spectrum analyzer look
+// like it's actually responding to the music's actual pitches rather
+// than just its bass line.
+const VIZ_BAR_COUNT = 48, VIZ_MIN_FREQ = 40, VIZ_MAX_FREQ = 14000;
+let barBins = null; // per bar: [firstBinIndex, lastBinIndex] to max() over
+
+function computeBarBins(){
+  const sampleRate = audioCtx.sampleRate;
+  const n = analyser.fftSize;
+  const maxFreq = Math.min(VIZ_MAX_FREQ, sampleRate / 2);
+  const freqToBin = f => Math.min(freqData.length - 1, Math.max(0, Math.round(f * n / sampleRate)));
+  const bins = [];
+  let prevBin = freqToBin(VIZ_MIN_FREQ);
+  for(let j = 1; j <= VIZ_BAR_COUNT; j++){
+    const freq = VIZ_MIN_FREQ * Math.pow(maxFreq / VIZ_MIN_FREQ, j / VIZ_BAR_COUNT);
+    const bin = Math.max(prevBin + 1, freqToBin(freq));
+    bins.push([prevBin, bin]);
+    prevBin = bin;
+  }
+  return bins;
 }
 
 // Peak-hold caps (rise instantly, fall slowly under "gravity") and a
@@ -487,47 +520,42 @@ function drawVisualizer(){
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  // Mirrored outward from the center (low frequencies innermost, high
-  // frequencies at the outer edges) rather than a plain left-to-right
-  // sweep — a left-to-right layout reliably looks lopsided in practice
-  // since bass frequencies dominate the low end of the spectrum, making
-  // the whole thing look tilted toward one side regardless of how well
-  // the canvas itself is centered on the page.
-  const half = Math.max(1, Math.floor(freqData.length / 2));
-  if(!peaks || peaks.length !== half) peaks = new Float32Array(half);
-  const barWidth = (w / 2) / half;
+  if(!barBins) barBins = computeBarBins();
+  const count = barBins.length;
+  if(!peaks || peaks.length !== count) peaks = new Float32Array(count);
+  const barWidth = w / count;
   const bw = Math.max(1, barWidth - 1);
   const baseline = h * 0.62;   // bars occupy the top ~62%...
   const reflH = h - baseline;  // ...and fade into a reflection below
 
-  for(let i = 0; i < half; i++){
-    const ratio = freqData[i] / 255;
-    const barHeight = ratio * baseline;
-    peaks[i] = Math.max(barHeight, peaks[i] - baseline * 0.02); // gravity
+  for(let j = 0; j < count; j++){
+    const [from, to] = barBins[j];
+    let peak = 0;
+    for(let i = from; i < to; i++) if(freqData[i] > peak) peak = freqData[i];
+    const barHeight = (peak / 255) * baseline;
+    peaks[j] = Math.max(barHeight, peaks[j] - baseline * 0.02); // gravity
 
+    const x = j * barWidth;
     const grad = ctx.createLinearGradient(0, baseline - barHeight, 0, baseline);
     grad.addColorStop(0, '#1ed760');
     grad.addColorStop(1, '#8b5cf6');
     ctx.fillStyle = grad;
-    for(const x of [w / 2 + i * barWidth, w / 2 - (i + 1) * barWidth]){
-      ctx.beginPath();
-      if(ctx.roundRect) ctx.roundRect(x, baseline - barHeight, bw, barHeight, [2, 2, 0, 0]);
-      else ctx.rect(x, baseline - barHeight, bw, barHeight);
-      ctx.fill();
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(x, baseline - barHeight, bw, barHeight, [2, 2, 0, 0]);
+    else ctx.rect(x, baseline - barHeight, bw, barHeight);
+    ctx.fill();
 
-      // Peak-hold cap
-      ctx.fillStyle = 'rgba(255,255,255,.85)';
-      ctx.fillRect(x, baseline - peaks[i] - 2, bw, 2);
-      ctx.fillStyle = grad;
+    // Peak-hold cap
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.fillRect(x, baseline - peaks[j] - 2, bw, 2);
 
-      // Reflection: same bar mirrored below the baseline, fading out
-      const rh = Math.min(barHeight, reflH);
-      const rGrad = ctx.createLinearGradient(0, baseline, 0, baseline + rh);
-      rGrad.addColorStop(0, 'rgba(30,215,96,.28)');
-      rGrad.addColorStop(1, 'rgba(139,92,246,0)');
-      ctx.fillStyle = rGrad;
-      ctx.fillRect(x, baseline, bw, rh);
-    }
+    // Reflection: same bar mirrored below the baseline, fading out
+    const rh = Math.min(barHeight, reflH);
+    const rGrad = ctx.createLinearGradient(0, baseline, 0, baseline + rh);
+    rGrad.addColorStop(0, 'rgba(30,215,96,.28)');
+    rGrad.addColorStop(1, 'rgba(139,92,246,0)');
+    ctx.fillStyle = rGrad;
+    ctx.fillRect(x, baseline, bw, rh);
   }
 }
 </script>
