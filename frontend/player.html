@@ -163,6 +163,17 @@ body::before{content:'';position:fixed;inset:0;
 <script>
 const API = '/api';
 const audio = document.getElementById('audio');
+
+// A per-browser id, generated once and kept in localStorage — invites are
+// scoped to whichever session created them (server-side), so a private/
+// incognito window genuinely starts with none of another browser's links,
+// rather than every open player page sharing one global invite list.
+let SESSION_ID = localStorage.getItem('jam_session_id');
+if(!SESSION_ID){
+  SESSION_ID = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  localStorage.setItem('jam_session_id', SESSION_ID);
+}
+const SESSION_HEADERS = {'X-Jam-Session': SESSION_ID};
 (async () => {
   const hint = document.getElementById('host-hint');
   hint.textContent = `${location.hostname}:9998`; // fallback until /config resolves (or if it fails)
@@ -367,7 +378,8 @@ function showInviteLink(path){
 async function generateInvite(){
   const ttl_seconds = parseInt(document.getElementById('ttl-select').value, 10);
   try{
-    const r = await fetch(`${API}/invite/create`, {method:'POST', headers:{'Content-Type':'application/json'},
+    const r = await fetch(`${API}/invite/create`, {method:'POST',
+      headers:{'Content-Type':'application/json', ...SESSION_HEADERS},
       body: JSON.stringify({ttl_seconds})});
     const d = await r.json();
     if(!r.ok){ alert(d.error || 'Could not create link'); return; }
@@ -392,7 +404,7 @@ function copyInvite(){
 
 async function refreshInviteList(){
   try{
-    const r = await fetch(`${API}/invite/list`);
+    const r = await fetch(`${API}/invite/list`, {headers: SESSION_HEADERS});
     const d = await r.json();
     const list = document.getElementById('im-list');
     if(!d.invites || !d.invites.length){ list.innerHTML = '<div class="im-empty">None yet</div>'; return; }
@@ -406,7 +418,7 @@ async function refreshInviteList(){
 }
 
 async function revokeInvite(token){
-  await fetch(`${API}/invite/${token}/revoke`, {method:'POST'});
+  await fetch(`${API}/invite/${token}/revoke`, {method:'POST', headers: SESSION_HEADERS});
   refreshInviteList();
 }
 

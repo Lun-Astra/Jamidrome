@@ -972,12 +972,18 @@ def route_invite_create():
     except (TypeError, ValueError):
         return jsonify({"error": "ttl_seconds must be a number"}), 400
     ttl_seconds = max(MIN_INVITE_TTL_SEC, min(MAX_INVITE_TTL_SEC, ttl_seconds))
+    # A per-browser id the frontend generates once and keeps in
+    # localStorage — invites are scoped to whichever session created
+    # them (see route_invite_list), so a private/incognito window (its
+    # own fresh id, no shared localStorage) correctly starts with none.
+    session_id = request.headers.get("X-Jam-Session", "")
 
     with state_lock:
         _prune_expired_invites()
         token = secrets.token_urlsafe(9)
         now = time.time()
-        state["invites"][token] = {"created_at": now, "expires_at": now + ttl_seconds, "ttl_seconds": ttl_seconds}
+        state["invites"][token] = {"created_at": now, "expires_at": now + ttl_seconds,
+                                    "ttl_seconds": ttl_seconds, "session_id": session_id}
         save_state()
         return jsonify({"token": token, "created_at": now, "expires_at": now + ttl_seconds,
                          "path": f"/invite/{token}"})
@@ -985,19 +991,27 @@ def route_invite_create():
 
 @app.route("/invite/list")
 def route_invite_list():
+    session_id = request.headers.get("X-Jam-Session", "")
     with state_lock:
         _prune_expired_invites()
         save_state()
-        invites = [{"token": t, **inv} for t, inv in state["invites"].items()]
+        invites = [{"token": t, **inv} for t, inv in state["invites"].items()
+                   if inv.get("session_id") == session_id]
     invites.sort(key=lambda i: i["created_at"], reverse=True)
     return jsonify({"invites": invites})
 
 
 @app.route("/invite/<token>/revoke", methods=["POST"])
 def route_invite_revoke(token):
+    session_id = request.headers.get("X-Jam-Session", "")
     with state_lock:
-        state["invites"].pop(token, None)
-        save_state()
+        inv = state["invites"].get(token)
+        # Only the session that created a link can revoke it — otherwise
+        # a browser that can't even see another session's link in its own
+        # list could still guess/target a token and kill someone else's.
+        if inv and inv.get("session_id") == session_id:
+            state["invites"].pop(token, None)
+            save_state()
     return jsonify({"ok": True})
 
 
