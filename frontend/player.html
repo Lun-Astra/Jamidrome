@@ -519,12 +519,21 @@ function drawVisualizer(){
   const bw = Math.max(1, barWidth - 1);
   const baseline = h * 0.62;   // bars occupy the top ~62%...
   const reflH = h - baseline;  // ...and fade into a reflection below
+  // getByteFrequencyData's minDecibels/maxDecibels span is wide (needs to
+  // be, to give quiet vs. loud PARTS OF A TRACK a real visual difference
+  // at a fixed volume) — 80dB of range means a volume-slider change alone
+  // barely moves a reading within it, so at half volume the bars still
+  // read almost as "loud" as at full volume. Scaling explicitly by the
+  // actual volume level (post-mute) guarantees the displayed range
+  // actually spans quiet-to-loud across the volume slider too, not just
+  // within whatever a single volume setting's own dynamics look like.
+  const volScale = audio.muted ? 0 : audio.volume;
 
   for(let j = 0; j < count; j++){
     const [from, to] = barBins[j];
     let peak = 0;
     for(let i = from; i < to; i++) if(freqData[i] > peak) peak = freqData[i];
-    const barHeight = (peak / 255) * baseline;
+    const barHeight = (peak / 255) * baseline * volScale;
     peaks[j] = Math.max(barHeight, peaks[j] - baseline * 0.02); // gravity
 
     const x = j * barWidth;
