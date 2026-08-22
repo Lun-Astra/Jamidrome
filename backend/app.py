@@ -77,7 +77,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 #          has it until it expires.
 state_lock = threading.Lock()
 state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None, "invites": {},
-         "paused": False, "pause_started_at": None}
+         "paused": False, "pause_started_at": None, "autoplay_enabled": True}
 
 
 def load_state():
@@ -564,6 +564,139 @@ def search_tracks(query, limit=SEARCH_RESULT_COUNT):
     return songs[:limit]
 
 
+def _parse_length_to_seconds(length):
+    """YT Music's get_watch_playlist reports each track's length as an
+    'M:SS' or 'H:MM:SS' string (its own duration_seconds field is
+    unreliable — often just None, as seen above) rather than a number."""
+    if not length:
+        return None
+    parts = str(length).split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return None
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds or None
+
+
+def get_similar_tracks(seed_video_id, limit=20, timeout=12):
+    """YouTube Music's own 'radio' continuation for a track — the same
+    'up next' logic YT Music's own autoplay uses, so what comes back is
+    genuinely stylistically similar rather than just 'more by this
+    artist'. Same lazy client / hard-timeout pattern as _search_ytmusic_songs,
+    since ytmusicapi's HTTP calls have no timeout of their own. Excludes the
+    seed track itself, which get_watch_playlist otherwise echoes back as
+    the first entry."""
+    ytm = _get_ytmusic()
+    if not ytm:
+        return []
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(ytm.get_watch_playlist, videoId=seed_video_id, limit=limit)
+        result = future.result(timeout=timeout)
+    except Exception as e:
+        print(f"[jam] get_watch_playlist failed for seed {seed_video_id}: {e}", file=sys.stderr)
+        return []
+    finally:
+        executor.shutdown(wait=False)
+
+    out = []
+    for t in (result or {}).get("tracks") or []:
+        video_id = t.get("videoId")
+        if not video_id or video_id == seed_video_id:
+            continue
+        artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a.get("name"))
+        out.append({
+            "video_id": video_id,
+            "title": t.get("title") or "Unknown title",
+            "artist": artists or "Unknown artist",
+            "album": (t.get("album") or {}).get("name") if isinstance(t.get("album"), dict) else None,
+            "duration": _parse_length_to_seconds(t.get("length")),
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            "url": f"https://music.youtube.com/watch?v={video_id}",
+        })
+    return out
+
+
+# ─── Autoplay ("Auto DJ") ────────────────────────────────────────────────────
+# When the queue runs completely dry, the jam shouldn't just go silent —
+# pick something similar to whatever played last and queue it exactly like
+# a real request, same download/tag/duplicate-check pipeline and all. Off
+# by default whenever there's nothing to seed it from (a brand new jam that
+# nobody's requested anything in yet); toggleable from the player page.
+
+_autofill_lock = threading.Lock()  # separate from state_lock: held for the
+                                    # whole (slow, network-bound) autofill
+                                    # attempt, just to stop two overlapping
+_autofill_running = False          # attempts rather than every state read
+_autofill_next_attempt_at = 0      # backoff after a fruitless attempt, so a
+                                    # run of "found nothing new" doesn't retry
+                                    # every 2 seconds forever
+
+AUTOFILL_COOLDOWN_SEC = 20
+AUTOFILL_HISTORY_AVOID = 25  # don't re-suggest anything played this recently
+
+
+def _autofill_seed_video_id():
+    """Must be called with state_lock held. Most-recently-played track with
+    a real video_id — which is every track, even a Navidrome-match one; see
+    _enqueue_track. None if this jam has no history yet at all."""
+    for item in reversed(state["history"]):
+        if item.get("video_id"):
+            return item["video_id"]
+    return None
+
+
+def maybe_trigger_autofill():
+    """Cheap check called from the watchdog loop every couple of seconds;
+    the actual network-bound work only happens in a spawned thread, and
+    only when nothing is already in flight."""
+    global _autofill_running
+    with state_lock:
+        if not state.get("autoplay_enabled", True):
+            return
+        if state["now_playing_id"] is not None or state["queue"]:
+            return
+        seed = _autofill_seed_video_id()
+    if not seed or time.time() < _autofill_next_attempt_at:
+        return
+    if not _autofill_lock.acquire(blocking=False):
+        return
+    _autofill_running = True
+    threading.Thread(target=_run_autofill, args=(seed,), daemon=True).start()
+
+
+def _run_autofill(seed_video_id):
+    global _autofill_next_attempt_at, _autofill_running
+    try:
+        with state_lock:
+            avoid_ids = {i["video_id"] for i in state["history"][-AUTOFILL_HISTORY_AVOID:] if i.get("video_id")}
+            avoid_ids |= {i["video_id"] for i in state["queue"]}
+        candidates = get_similar_tracks(seed_video_id, limit=20)
+        pick = next((c for c in candidates if c["video_id"] not in avoid_ids), None)
+        if not pick:
+            _autofill_next_attempt_at = time.time() + AUTOFILL_COOLDOWN_SEC
+            return
+        item, err = _enqueue_track(
+            pick["video_id"], pick["url"], pick["title"], pick["artist"],
+            duration=pick["duration"], thumbnail=pick["thumbnail"],
+            known_album=pick.get("album") or "", requested_by="🔁 Auto DJ")
+        if err:
+            # Near-impossible (a fresh video_id colliding with the now-empty
+            # queue), but don't hammer on it if it somehow happens.
+            _autofill_next_attempt_at = time.time() + AUTOFILL_COOLDOWN_SEC
+        else:
+            print(f"[jam] Auto DJ queued: {pick['artist']} - {pick['title']}", flush=True)
+    except Exception as e:
+        print(f"[jam] Autofill failed: {e}", flush=True)
+        _autofill_next_attempt_at = time.time() + AUTOFILL_COOLDOWN_SEC
+    finally:
+        _autofill_running = False
+        _autofill_lock.release()
+
+
 def ffprobe_duration(path):
     try:
         r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -815,6 +948,7 @@ def watchdog_loop():
             duration = (cur or {}).get("duration") or 0
         if cur and started and not paused and time.time() - started > duration + ADVANCE_BUFFER_SEC:
             advance()
+        maybe_trigger_autofill()
 
 
 # ─── Invite links ────────────────────────────────────────────────────────────
@@ -868,25 +1002,21 @@ def route_queue_get():
             "playback_started_at": state["playback_started_at"],
             "paused": state["paused"],
             "pause_started_at": state["pause_started_at"],
+            "autoplay_enabled": state.get("autoplay_enabled", True),
             "queue": [public_view(i) for i in state["queue"] if i["status"] != "playing"],
             "history": [public_view(i) for i in state["history"][-10:]],
         })
 
 
-@app.route("/queue/add", methods=["POST"])
-def route_queue_add():
-    data = request.json or {}
-    video_id = (data.get("video_id") or "").strip()
-    url = (data.get("url") or "").strip()
-    title = (data.get("title") or "Unknown title").strip()
-    artist = (data.get("artist") or "Unknown artist").strip()
-    duration = data.get("duration")
-    # Present when the pick came from the YT Music 'songs' search tier —
-    # its own real album name, straight from the authoritative source,
-    # rather than something download_track() has to go guess afterward.
-    known_album = (data.get("album") or "").strip()
-    if not video_id or not url:
-        return jsonify({"error": "video_id and url are required"}), 400
+def _enqueue_track(video_id, url, title, artist, duration=None, thumbnail="",
+                    known_album="", requested_by="Anonymous"):
+    """Shared by the manual /queue/add route and the similar-songs autofill
+    below — same duplicate check, same Navidrome-match short-circuit, same
+    queue bookkeeping, so an auto-picked track is treated exactly like a
+    human-requested one from here on. Returns (item_or_none, error_or_none);
+    error is a (message, http_status) pair when not None."""
+    title = (title or "Unknown title").strip()
+    artist = (artist or "Unknown artist").strip()
 
     # Checked outside state_lock — it's a Navidrome network call, not
     # shared in-memory state, and shouldn't hold up every other request
@@ -896,13 +1026,13 @@ def route_queue_add():
     with state_lock:
         active_ids = {i["video_id"] for i in state["queue"] if i["status"] in ("queued", "downloading", "ready", "playing")}
         if video_id in active_ids:
-            return jsonify({"error": "That song is already in the queue"}), 409
+            return None, ("That song is already in the queue", 409)
 
         item = {
             "id": uuid.uuid4().hex[:12],
             "video_id": video_id, "url": url,
-            "thumbnail": data.get("thumbnail") or "",
-            "requested_by": (data.get("requested_by") or "Anonymous").strip()[:40] or "Anonymous",
+            "thumbnail": thumbnail or "",
+            "requested_by": (requested_by or "Anonymous").strip()[:40] or "Anonymous",
             "added_at": time.time(), "progress": 0,
         }
         if match:
@@ -925,7 +1055,29 @@ def route_queue_add():
         # triggers it, and this item never goes through that path at all.
         _promote_next_if_idle()
         save_state()
-        return jsonify(public_view(item))
+        return item, None
+
+
+@app.route("/queue/add", methods=["POST"])
+def route_queue_add():
+    data = request.json or {}
+    video_id = (data.get("video_id") or "").strip()
+    url = (data.get("url") or "").strip()
+    if not video_id or not url:
+        return jsonify({"error": "video_id and url are required"}), 400
+
+    item, err = _enqueue_track(
+        video_id, url, data.get("title"), data.get("artist"),
+        duration=data.get("duration"), thumbnail=data.get("thumbnail"),
+        # Present when the pick came from the YT Music 'songs' search tier —
+        # its own real album name, straight from the authoritative source,
+        # rather than something download_track() has to go guess afterward.
+        known_album=(data.get("album") or "").strip(),
+        requested_by=data.get("requested_by"))
+    if err:
+        message, status = err
+        return jsonify({"error": message}), status
+    return jsonify(public_view(item))
 
 
 @app.route("/queue/<item_id>/remove", methods=["POST"])
@@ -950,8 +1102,19 @@ def route_player_state():
             "playback_started_at": state["playback_started_at"],
             "paused": state["paused"],
             "pause_started_at": state["pause_started_at"],
+            "autoplay_enabled": state.get("autoplay_enabled", True),
+            "autofill_in_progress": _autofill_running,
             "up_next": [public_view(i) for i in state["queue"] if i["status"] != "playing"][:10],
         })
+
+
+@app.route("/player/autoplay", methods=["POST"])
+def route_player_autoplay():
+    data = request.json or {}
+    with state_lock:
+        state["autoplay_enabled"] = bool(data.get("enabled", True))
+        save_state()
+        return jsonify({"autoplay_enabled": state["autoplay_enabled"]})
 
 
 @app.route("/player/advance", methods=["POST"])

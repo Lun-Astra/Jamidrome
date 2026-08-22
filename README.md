@@ -62,6 +62,18 @@ Both talk to the same Flask backend, which:
    own `ended` event, with a server-side timer as a fallback in case the
    player page gets closed or the browser hiccups, so the jam doesn't get
    stuck waiting for a signal that may never arrive.
+8. **Auto DJ**: if the queue ever runs completely dry (nothing playing,
+   nothing waiting) it doesn't just go silent — it asks YouTube Music for
+   a "radio" continuation seeded from whatever played last (the same
+   up-next logic behind YouTube Music's own autoplay, so what comes back
+   is genuinely similar rather than just "more by this artist"), skips
+   anything played recently, and queues one pick through the exact same
+   download/tag/duplicate-check pipeline as a real request — tagged
+   `requested_by: "🔁 Auto DJ"` so it's obviously distinct from an actual
+   person's pick. Toggleable from the player page (top right); off by
+   default only when the jam has no history at all yet to seed a pick
+   from. A real request dropped in at any point always takes priority —
+   Auto DJ only ever adds when the queue is otherwise completely empty.
 
 Pause is a real, global pause on the one shared jam — not a per-browser
 thing. If you happen to have the player page open in more than one place

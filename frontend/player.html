@@ -54,8 +54,9 @@ body::before{content:'';position:fixed;inset:0;
 .un-item .dl-bar-fill{height:100%;background:linear-gradient(90deg,var(--sp),var(--nd));transition:width .4s linear}
 
 .top-right{position:fixed;top:22px;right:28px;display:flex;align-items:center;gap:10px;z-index:5}
-#skip-btn,#pause-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer}
-#skip-btn:hover,#pause-btn:hover{color:var(--text)}
+#skip-btn,#pause-btn,#autodj-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer}
+#skip-btn:hover,#pause-btn:hover,#autodj-btn:hover{color:var(--text)}
+#autodj-btn.off{opacity:.5}
 .vol-ctrl{display:flex;align-items:center;gap:7px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:7px 14px}
 .vol-ctrl button{background:none;border:none;color:var(--text2);font-size:14px;cursor:pointer;line-height:1}
 .vol-ctrl button:hover{color:var(--text)}
@@ -108,6 +109,7 @@ body::before{content:'';position:fixed;inset:0;
   </div>
   <button id="pause-btn" onclick="togglePause()" style="display:none">⏸ Pause</button>
   <button id="skip-btn" onclick="skip()" style="display:none">⏭ Skip</button>
+  <button id="autodj-btn" onclick="toggleAutoplay()" title="When on, picks and plays something similar once the queue runs dry">🔁 Auto DJ: On</button>
 </div>
 <button id="invite-btn" onclick="openInvite()">🔗 Invite</button>
 <button id="audio-unlock" onclick="tryPlay()">🔇 Tap to enable sound</button>
@@ -237,6 +239,24 @@ function togglePause(){
   updatePauseIcon();
 }
 
+// ── Auto DJ ──────────────────────────────────────────────────────────────
+// Same "server is the source of truth, button just reflects it" approach
+// as pause — every open player page shows the same on/off state, since
+// it's a property of the one shared jam, not anything per-browser.
+let autoplayEnabled = true;
+function updateAutoDjBtn(){
+  const btn = document.getElementById('autodj-btn');
+  btn.textContent = `🔁 Auto DJ: ${autoplayEnabled ? 'On' : 'Off'}`;
+  btn.classList.toggle('off', !autoplayEnabled);
+}
+function toggleAutoplay(){
+  autoplayEnabled = !autoplayEnabled;
+  updateAutoDjBtn();
+  fetch(`${API}/player/autoplay`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: autoplayEnabled})});
+}
+updateAutoDjBtn();
+
 async function startJam(){
   document.getElementById('overlay').style.display = 'none';
   audio.muted = false;
@@ -273,6 +293,22 @@ function render(d){
   document.getElementById('idle-view').style.display = np ? 'none' : 'block';
   document.getElementById('skip-btn').style.display = np ? 'block' : 'none';
   document.getElementById('pause-btn').style.display = np ? 'block' : 'none';
+
+  if(typeof d.autoplay_enabled === 'boolean' && d.autoplay_enabled !== autoplayEnabled){
+    autoplayEnabled = d.autoplay_enabled;
+    updateAutoDjBtn();
+  }
+  if(!np){
+    const big = document.querySelector('#idle-view .big');
+    const hint = document.querySelector('#idle-view .hint');
+    if(d.autofill_in_progress){
+      big.textContent = '🔁 Auto DJ is picking something…';
+      hint.style.display = 'none';
+    }else{
+      big.textContent = 'Waiting for requests…';
+      hint.style.display = 'block';
+    }
+  }
 
   if(np){
     jamPaused = !!d.paused;
