@@ -22,12 +22,27 @@ instead of syncing whole playlists.
   at after downloading. Plain YouTube search only fills in whatever's left
   (deduped), so covers/live versions are still findable, just never
   crowding out the real thing.
+
+  Every not-yet-playing track has an **▲ upvote** button — votes bump a
+  track's effective position in the queue (and jump it ahead for
+  downloading too), toggleable by clicking again to take your vote back.
+  Whatever's currently playing has a **⏭ vote-to-skip** button instead,
+  for anyone without access to the actual player screen; once enough
+  people vote (a small fixed number — there's no accounts/presence here
+  to compute a real majority against) it skips immediately. A "Recently
+  Played" list at the bottom has a **↺** on each track to put it straight
+  back on the queue. One browser can only have a few requests waiting at
+  once (a small fixed cap) so nobody can monopolize the whole queue —
+  votes and the cap both key off a per-browser id kept in `localStorage`,
+  the same mechanism the player page's invite links already use.
 - **Player** (port `9999`). Open this once, on whatever's connected to the
   speakers (a TV, an old laptop, whatever), and leave it open — this is
   the one real jam, playing for the room. It plays the queue automatically
   as songs become ready, with **⏭ Skip** and a real **⏸ Pause** (pausing
   affects the shared jam for everyone watching, same as pausing a normal
-  music player — it's not a per-browser thing).
+  music player — it's not a per-browser thing), and crossfades into the
+  next track over its last few seconds rather than cutting hard — see
+  **Crossfade** below.
 
 Both ports are meant to sit behind your own reverse proxy rather than be
 opened directly — see **Behind a reverse proxy** below.
@@ -62,18 +77,22 @@ Both talk to the same Flask backend, which:
    own `ended` event, with a server-side timer as a fallback in case the
    player page gets closed or the browser hiccups, so the jam doesn't get
    stuck waiting for a signal that may never arrive.
-8. **Auto DJ**: if the queue ever runs completely dry (nothing playing,
-   nothing waiting) it doesn't just go silent — it asks YouTube Music for
-   a "radio" continuation seeded from whatever played last (the same
+8. **Auto DJ**: if nothing's lined up behind whatever's currently playing
+   (or the jam is fully idle), it doesn't just go silent — it asks
+   YouTube Music for a "radio" continuation seeded from whatever's
+   playing right now, or whatever played last if nothing is (the same
    up-next logic behind YouTube Music's own autoplay, so what comes back
    is genuinely similar rather than just "more by this artist"), skips
    anything played recently, and queues one pick through the exact same
    download/tag/duplicate-check pipeline as a real request — tagged
    `requested_by: "🔁 Auto DJ"` so it's obviously distinct from an actual
-   person's pick. Toggleable from the player page (top right); off by
-   default only when the jam has no history at all yet to seed a pick
-   from. A real request dropped in at any point always takes priority —
-   Auto DJ only ever adds when the queue is otherwise completely empty.
+   person's pick. It fires *before* a track ends, not only once the queue
+   is already empty — otherwise every Auto DJ pick would mean an actual
+   silence gap while it searches and downloads. Toggleable from the
+   player page (top right); off by default only when the jam has no
+   history at all yet to seed a pick from. A real request dropped in at
+   any point always takes priority — Auto DJ only ever adds when nothing
+   else is already waiting.
 
 Pause is a real, global pause on the one shared jam — not a per-browser
 thing. If you happen to have the player page open in more than one place
@@ -81,6 +100,32 @@ at once, they all show (and play) the exact same state; there's no
 "individual session" behind any of it. Reloading the page (or resuming
 from pause) picks up wherever the shared timeline currently is rather
 than restarting the track from 0:00.
+
+## Crossfade
+
+The player page fades into the next track over its last few seconds
+instead of cutting hard — but only when that next track is *actually
+already downloaded* by then (Auto DJ's early-prefetch above exists partly
+to make that the common case). If it isn't ready in time, playback just
+falls back to the exact hard-cut-at-`ended` behavior from before —
+crossfading is purely a bonus layered on top, never something the jam
+waits on or can get stuck because of.
+
+Implementation-wise, it deliberately avoids touching the page's existing
+Web Audio graph (the one feeding the spectrum visualizer) at all — that
+graph has been a real source of hard-to-debug silent-audio bugs in this
+project before, and crossfading doesn't need it. A second, ordinary
+`<audio>` element (never routed through `createMediaElementSource`, so it
+just plays through the browser's normal output like any two concurrent
+`<audio>` elements on a page do) gets preloaded with whatever's on deck.
+Once the current track is within a few seconds of ending, both play
+together while their volumes ramp between them; at the end of the ramp,
+the *original* `#audio` element itself takes over the new track — seeking
+to wherever the temporary element had reached — so it stays the one
+thing the visualizer and volume/mute controls ever have to deal with. The
+cost of that simplicity is a handoff blip well under a second right at
+the end of each crossfade, traded deliberately for not needing a second
+full Web Audio chain.
 
 ## Inviting people
 

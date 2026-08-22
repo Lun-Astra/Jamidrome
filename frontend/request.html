@@ -59,8 +59,16 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .q-item .dl-bar{height:4px;background:var(--bg4);border-radius:2px;margin-top:5px;overflow:hidden}
 .q-item .dl-bar-fill{height:100%;background:linear-gradient(90deg,var(--sp),var(--nd));transition:width .4s linear}
 .status-badge.ready{background:rgba(30,215,96,.12);color:#4ade80}
-.remove-btn{background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:2px 4px;flex-shrink:0}
+.status-badge.failed{background:rgba(248,113,113,.12);color:#f87171}
+.remove-btn,.requeue-btn{background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:2px 4px;flex-shrink:0}
 .remove-btn:hover{color:#f87171}
+.requeue-btn:hover{color:var(--sp)}
+.vote-btn{display:flex;align-items:center;gap:3px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:14px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer;flex-shrink:0}
+.vote-btn:hover{color:var(--text)}
+.vote-btn.on{background:rgba(30,215,96,.14);border-color:rgba(30,215,96,.35);color:#4ade80}
+.skip-vote-btn{display:flex;align-items:center;gap:4px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:16px;padding:6px 12px;font-size:11px;font-weight:600;cursor:pointer;flex-shrink:0}
+.skip-vote-btn:hover{color:var(--text)}
+.skip-vote-btn.on{background:rgba(248,113,113,.14);border-color:rgba(248,113,113,.35);color:#f87171}
 
 .empty{padding:24px;text-align:center;color:var(--text3);font-size:12.5px}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--bg4);border:1px solid var(--border2);border-radius:20px;padding:10px 18px;font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;pointer-events:none;z-index:50}
@@ -88,6 +96,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 
   <div class="section-title">Up Next (<span id="queue-count">0</span>)</div>
   <div class="results" id="queue-list"><div class="empty">Queue is empty</div></div>
+
+  <div class="section-title">Recently Played</div>
+  <div class="results" id="history-list"><div class="empty">Nothing yet</div></div>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -96,6 +107,17 @@ const API = '/api';
 const nameInput = document.getElementById('name-input');
 nameInput.value = localStorage.getItem('jam_name') || '';
 nameInput.addEventListener('input', () => localStorage.setItem('jam_name', nameInput.value));
+
+// A per-browser id, same mechanism the player page uses for invites — here
+// it's what a vote (upvote / skip-vote) and the per-person pending-request
+// cap key off of, so it's "one vote per browser" rather than one vote per
+// request with no memory of who already voted.
+let SESSION_ID = localStorage.getItem('jam_session_id');
+if(!SESSION_ID){
+  SESSION_ID = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  localStorage.setItem('jam_session_id', SESSION_ID);
+}
+const SESSION_HEADERS = {'X-Jam-Session': SESSION_ID};
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function fmtDur(s){if(!s)return'';s=Math.round(s);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;}
@@ -130,7 +152,7 @@ document.getElementById('search-input').addEventListener('keydown', e => { if(e.
 async function addToQueue(res, btnEl){
   btnEl.disabled = true; btnEl.textContent = '…';
   try{
-    const r = await fetch(`${API}/queue/add`, {method:'POST', headers:{'Content-Type':'application/json'},
+    const r = await fetch(`${API}/queue/add`, {method:'POST', headers:{'Content-Type':'application/json', ...SESSION_HEADERS},
       body: JSON.stringify({...res, requested_by: nameInput.value.trim() || 'Anonymous'})});
     const d = await r.json();
     if(!r.ok){toast(d.error || 'Could not add'); btnEl.disabled = false; btnEl.textContent = '+ Add'; return;}
@@ -140,13 +162,42 @@ async function addToQueue(res, btnEl){
 }
 
 async function removeItem(id){
-  await fetch(`${API}/queue/${id}/remove`, {method:'POST'});
+  await fetch(`${API}/queue/${id}/remove`, {method:'POST', headers: SESSION_HEADERS});
   refreshQueue();
+}
+
+async function upvoteItem(id){
+  try{
+    const r = await fetch(`${API}/queue/${id}/upvote`, {method:'POST', headers: SESSION_HEADERS});
+    await r.json();
+    refreshQueue();
+  }catch(e){}
+}
+
+async function voteSkip(id){
+  try{
+    const r = await fetch(`${API}/queue/${id}/vote-skip`, {method:'POST', headers: SESSION_HEADERS});
+    const d = await r.json();
+    if(d.skipped) toast('Skip vote passed — moving on');
+    refreshQueue();
+  }catch(e){}
+}
+
+async function requeueItem(id, btnEl){
+  btnEl.disabled = true;
+  try{
+    const r = await fetch(`${API}/history/${id}/requeue`, {method:'POST', headers:{'Content-Type':'application/json', ...SESSION_HEADERS},
+      body: JSON.stringify({requested_by: nameInput.value.trim() || 'Anonymous'})});
+    const d = await r.json();
+    if(!r.ok){toast(d.error || 'Could not requeue'); btnEl.disabled = false; return;}
+    toast(`Added "${d.title}" back to the queue`);
+    refreshQueue();
+  }catch(e){toast('Failed: ' + e.message); btnEl.disabled = false;}
 }
 
 async function refreshQueue(){
   try{
-    const r = await fetch(`${API}/queue`);
+    const r = await fetch(`${API}/queue`, {headers: SESSION_HEADERS});
     const d = await r.json();
     // No early-return-if-unchanged here: now_playing's own fields (id,
     // title, duration, ...) don't change while a track is still playing,
@@ -158,21 +209,23 @@ async function refreshQueue(){
     if(d.now_playing){
       const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
       const pct = d.now_playing.duration ? Math.min(100, elapsed/d.now_playing.duration*100) : 0;
+      const sv = d.now_playing.skip_votes || 0, st = d.now_playing.skip_threshold || 3;
       np.innerHTML = `
         <img src="${esc(d.now_playing.thumbnail)}">
         <div style="flex:1;min-width:0">
           <div class="np-title">${esc(d.now_playing.title)}</div>
           <div class="np-artist">${esc(d.now_playing.artist)} · requested by ${esc(d.now_playing.requested_by)}</div>
           <div class="np-bar"><div class="np-bar-fill" style="width:${pct}%"></div></div>
-        </div>`;
+        </div>
+        <button class="skip-vote-btn ${d.now_playing.voted_skip_by_me ? 'on' : ''}" onclick="voteSkip('${d.now_playing.id}')" title="Vote to skip this track">⏭ ${sv}/${st}</button>`;
     } else {
       np.innerHTML = '<div class="np-empty">Nothing playing yet — be the first to add a song.</div>';
     }
 
     document.getElementById('queue-count').textContent = d.queue.length;
     const list = document.getElementById('queue-list');
-    if(!d.queue.length){ list.innerHTML = '<div class="empty">Queue is empty</div>'; return; }
-    list.innerHTML = d.queue.map(item => `
+    if(!d.queue.length){ list.innerHTML = '<div class="empty">Queue is empty</div>'; }
+    else list.innerHTML = d.queue.map(item => `
       <div class="q-item">
         <img src="${esc(item.thumbnail)}">
         <div class="info">
@@ -180,8 +233,22 @@ async function refreshQueue(){
           <div class="s">${esc(item.artist)} · requested by ${esc(item.requested_by)}</div>
           ${item.status === 'downloading' ? `<div class="dl-bar"><div class="dl-bar-fill" style="width:${Math.max(2, item.progress || 0)}%"></div></div>` : ''}
         </div>
+        <button class="vote-btn ${item.voted_by_me ? 'on' : ''}" onclick="upvoteItem('${item.id}')" title="Upvote — bumps it up the queue">▲ ${item.votes || 0}</button>
         <span class="status-badge ${item.status}">${item.status === 'downloading' ? Math.round(item.progress || 0) + '%' : item.status}</span>
         ${item.status === 'queued' ? `<button class="remove-btn" onclick="removeItem('${item.id}')" title="Remove">✕</button>` : ''}
+      </div>`).join('');
+
+    const hist = document.getElementById('history-list');
+    const played = (d.history || []).filter(h => h.status === 'done').slice().reverse();
+    if(!played.length){ hist.innerHTML = '<div class="empty">Nothing yet</div>'; }
+    else hist.innerHTML = played.map(item => `
+      <div class="q-item">
+        <img src="${esc(item.thumbnail)}">
+        <div class="info">
+          <div class="t">${esc(item.title)}</div>
+          <div class="s">${esc(item.artist)} · requested by ${esc(item.requested_by)}</div>
+        </div>
+        <button class="requeue-btn" onclick="requeueItem('${item.id}', this)" title="Add back to the queue">↺</button>
       </div>`).join('');
   }catch(e){}
 }

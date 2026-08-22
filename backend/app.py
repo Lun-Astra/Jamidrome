@@ -57,6 +57,14 @@ MAX_HISTORY         = 50
 ADVANCE_BUFFER_SEC   = 5     # grace period added on top of a track's own duration
                              # before the server auto-advances without a client signal
 SEARCH_RESULT_COUNT  = 10
+MAX_PENDING_PER_SESSION = 3  # a request not yet played counts as "pending" —
+                             # caps how much of the queue one browser can hold
+                             # at once so nobody can monopolize it. Auto DJ's
+                             # own picks have no session_id and are exempt.
+SKIP_VOTE_THRESHOLD  = 3     # no accounts/presence tracking to compute a real
+                             # quorum against, so this is a fixed, small "enough
+                             # people are annoyed" bar rather than a majority
+                             # of anything actually counted.
 # Set when the request/player pages sit behind a reverse proxy on separate
 # hostnames (e.g. jam.example.com / aanvragenjam.example.com) rather than
 # being reached directly on :9999/:9998 — there's no way to derive one
@@ -116,9 +124,17 @@ def find_item(item_id):
     return None
 
 
-def public_view(item, include_stream=False):
+def public_view(item, include_stream=False, session_id=None):
     v = {k: item.get(k) for k in ("id", "video_id", "title", "artist", "thumbnail", "album", "genre",
                                    "duration", "status", "requested_by", "added_at", "progress")}
+    upvotes = item.get("upvotes") or []
+    v["votes"] = len(upvotes)
+    v["voted_by_me"] = bool(session_id) and session_id in upvotes
+    if item.get("status") == "playing":
+        skip_votes = item.get("skip_votes") or []
+        v["skip_votes"] = len(skip_votes)
+        v["skip_threshold"] = SKIP_VOTE_THRESHOLD
+        v["voted_skip_by_me"] = bool(session_id) and session_id in skip_votes
     if include_stream:
         # /api/ prefix matters: nginx only proxies paths under /api/ to this
         # backend on both ports — everything else falls through to its SPA
@@ -640,9 +656,15 @@ AUTOFILL_HISTORY_AVOID = 25  # don't re-suggest anything played this recently
 
 
 def _autofill_seed_video_id():
-    """Must be called with state_lock held. Most-recently-played track with
-    a real video_id — which is every track, even a Navidrome-match one; see
-    _enqueue_track. None if this jam has no history yet at all."""
+    """Must be called with state_lock held. Whatever's playing right now if
+    anything is (the most locally-relevant seed — matters once autofill can
+    fire pre-emptively, before that track has even finished), else the
+    most-recently-played track from history. A real video_id either way —
+    every track has one, even a Navidrome-match one; see _enqueue_track.
+    None if this jam has no history yet at all and nothing is playing."""
+    cur = find_item(state["now_playing_id"]) if state["now_playing_id"] else None
+    if cur and cur.get("video_id"):
+        return cur["video_id"]
     for item in reversed(state["history"]):
         if item.get("video_id"):
             return item["video_id"]
@@ -652,12 +674,22 @@ def _autofill_seed_video_id():
 def maybe_trigger_autofill():
     """Cheap check called from the watchdog loop every couple of seconds;
     the actual network-bound work only happens in a spawned thread, and
-    only when nothing is already in flight."""
+    only when nothing is already in flight.
+
+    Fires whenever nothing is lined up *behind* whatever's currently
+    playing — not only once the jam goes fully idle. Firing only on full
+    idle meant a real silence gap every time: the current track ends,
+    now_playing goes empty, autofill starts a search+download that can
+    itself take 10-60s, and only then does anything play. Checking for
+    "no upcoming item" instead lets it prefetch and download the next
+    pick *while* the current one is still playing, so it's usually
+    already sitting there ready by the time it's actually needed."""
     global _autofill_running
     with state_lock:
         if not state.get("autoplay_enabled", True):
             return
-        if state["now_playing_id"] is not None or state["queue"]:
+        upcoming = [i for i in state["queue"] if i["status"] != "playing"]
+        if upcoming:
             return
         seed = _autofill_seed_video_id()
     if not seed or time.time() < _autofill_next_attempt_at:
@@ -834,15 +866,27 @@ def sync_to_navidrome_bg(item):
 
 # ─── Queue engine ────────────────────────────────────────────────────────────
 
+def _queue_sort_key(item):
+    """Higher votes first, ties broken by request order — used everywhere
+    'what's next' matters (promoting, picking what to download next,
+    what's displayed as up-next) instead of raw list position, so an
+    upvoted track actually jumps the line rather than just looking more
+    popular where it already sat."""
+    return (-len(item.get("upvotes") or []), item.get("added_at", 0))
+
+
 def _promote_next_if_idle():
-    """If nothing is playing and the head of the queue is ready, start it.
-    Must be called with state_lock held."""
+    """If nothing is playing, start the highest-voted ready item. Must be
+    called with state_lock held."""
     if state["now_playing_id"] is not None:
         return
-    while state["queue"] and state["queue"][0]["status"] == "failed":
-        state["history"].append(state["queue"].pop(0))
-    if state["queue"] and state["queue"][0]["status"] == "ready":
-        nxt = state["queue"][0]
+    failed = [i for i in state["queue"] if i["status"] == "failed"]
+    for item in failed:
+        state["queue"].remove(item)
+        state["history"].append(item)
+    ready = [i for i in state["queue"] if i["status"] == "ready"]
+    if ready:
+        nxt = min(ready, key=_queue_sort_key)
         nxt["status"] = "playing"
         state["now_playing_id"] = nxt["id"]
         state["playback_started_at"] = time.time()
@@ -909,7 +953,8 @@ def advance(expected_id=None):
 def download_worker_loop():
     while True:
         with state_lock:
-            item = next((i for i in state["queue"] if i["status"] == "queued"), None)
+            queued = [i for i in state["queue"] if i["status"] == "queued"]
+            item = min(queued, key=_queue_sort_key) if queued else None
             if item:
                 item["status"] = "downloading"
         if not item:
@@ -995,26 +1040,29 @@ def route_search():
 
 @app.route("/queue", methods=["GET"])
 def route_queue_get():
+    session_id = request.headers.get("X-Jam-Session", "")
     with state_lock:
         now_playing = find_item(state["now_playing_id"]) if state["now_playing_id"] else None
+        upcoming = sorted((i for i in state["queue"] if i["status"] != "playing"), key=_queue_sort_key)
         return jsonify({
-            "now_playing": public_view(now_playing, include_stream=True) if now_playing else None,
+            "now_playing": public_view(now_playing, include_stream=True, session_id=session_id) if now_playing else None,
             "playback_started_at": state["playback_started_at"],
             "paused": state["paused"],
             "pause_started_at": state["pause_started_at"],
             "autoplay_enabled": state.get("autoplay_enabled", True),
-            "queue": [public_view(i) for i in state["queue"] if i["status"] != "playing"],
-            "history": [public_view(i) for i in state["history"][-10:]],
+            "queue": [public_view(i, session_id=session_id) for i in upcoming],
+            "history": [public_view(i, session_id=session_id) for i in state["history"][-10:]],
         })
 
 
 def _enqueue_track(video_id, url, title, artist, duration=None, thumbnail="",
-                    known_album="", requested_by="Anonymous"):
-    """Shared by the manual /queue/add route and the similar-songs autofill
-    below — same duplicate check, same Navidrome-match short-circuit, same
-    queue bookkeeping, so an auto-picked track is treated exactly like a
-    human-requested one from here on. Returns (item_or_none, error_or_none);
-    error is a (message, http_status) pair when not None."""
+                    known_album="", requested_by="Anonymous", session_id=None):
+    """Shared by the manual /queue/add route, the requeue-from-history
+    route, and the similar-songs autofill below — same duplicate check,
+    same Navidrome-match short-circuit, same queue bookkeeping, so any of
+    those is treated exactly like a plain human request from here on.
+    Returns (item_or_none, error_or_none); error is a (message,
+    http_status) pair when not None."""
     title = (title or "Unknown title").strip()
     artist = (artist or "Unknown artist").strip()
 
@@ -1028,11 +1076,23 @@ def _enqueue_track(video_id, url, title, artist, duration=None, thumbnail="",
         if video_id in active_ids:
             return None, ("That song is already in the queue", 409)
 
+        # A "pending" request is one that hasn't played yet — caps how much
+        # of the queue any one browser can hold at once, so nobody can
+        # monopolize it. Auto DJ's own picks (session_id=None) are exempt,
+        # and a track already playing no longer counts as pending.
+        if session_id:
+            pending = sum(1 for i in state["queue"]
+                          if i.get("session_id") == session_id and i["status"] in ("queued", "downloading", "ready"))
+            if pending >= MAX_PENDING_PER_SESSION:
+                return None, (f"You already have {MAX_PENDING_PER_SESSION} songs waiting — "
+                               f"wait for one of them to play first", 429)
+
         item = {
             "id": uuid.uuid4().hex[:12],
             "video_id": video_id, "url": url,
             "thumbnail": thumbnail or "",
             "requested_by": (requested_by or "Anonymous").strip()[:40] or "Anonymous",
+            "session_id": session_id,
             "added_at": time.time(), "progress": 0,
         }
         if match:
@@ -1065,6 +1125,7 @@ def route_queue_add():
     url = (data.get("url") or "").strip()
     if not video_id or not url:
         return jsonify({"error": "video_id and url are required"}), 400
+    session_id = request.headers.get("X-Jam-Session", "")
 
     item, err = _enqueue_track(
         video_id, url, data.get("title"), data.get("artist"),
@@ -1073,11 +1134,86 @@ def route_queue_add():
         # its own real album name, straight from the authoritative source,
         # rather than something download_track() has to go guess afterward.
         known_album=(data.get("album") or "").strip(),
-        requested_by=data.get("requested_by"))
+        requested_by=data.get("requested_by"), session_id=session_id)
     if err:
         message, status = err
         return jsonify({"error": message}), status
-    return jsonify(public_view(item))
+    return jsonify(public_view(item, session_id=session_id))
+
+
+@app.route("/queue/<item_id>/upvote", methods=["POST"])
+def route_queue_upvote(item_id):
+    """Toggles this session's upvote on a not-yet-playing item — call again
+    to take it back. Bumps the item's effective position (see
+    _queue_sort_key) rather than physically moving it in the list, so
+    added_at stays a meaningful tiebreak and nothing else has to change to
+    respect the new order."""
+    session_id = request.headers.get("X-Jam-Session", "") or request.remote_addr or ""
+    with state_lock:
+        item = find_item(item_id)
+        if not item or item["status"] == "playing":
+            return jsonify({"error": "Not found"}), 404
+        upvotes = item.setdefault("upvotes", [])
+        if session_id in upvotes:
+            upvotes.remove(session_id)
+            voted = False
+        else:
+            upvotes.append(session_id)
+            voted = True
+        save_state()
+        return jsonify({"votes": len(upvotes), "voted_by_me": voted})
+
+
+@app.route("/queue/<item_id>/vote-skip", methods=["POST"])
+def route_vote_skip(item_id):
+    """Democratic skip for guests on the request page, who have no other
+    way to skip — the player page's own Skip button already acts
+    immediately for whoever's standing at the actual display. A small
+    fixed threshold rather than a real majority: there's no accounts or
+    presence tracking here to know how many people are actually in the
+    jam right now to compute one against."""
+    session_id = request.headers.get("X-Jam-Session", "") or request.remote_addr or ""
+    with state_lock:
+        if state["now_playing_id"] != item_id:
+            return jsonify({"error": "That track isn't currently playing"}), 400
+        item = find_item(item_id)
+        skip_votes = item.setdefault("skip_votes", [])
+        if session_id not in skip_votes:
+            skip_votes.append(session_id)
+        count = len(skip_votes)
+        will_skip = count >= SKIP_VOTE_THRESHOLD
+        if not will_skip:
+            save_state()
+    if will_skip:
+        advance(expected_id=item_id)  # outside state_lock — advance() takes its own
+    return jsonify({"skip_votes": min(count, SKIP_VOTE_THRESHOLD), "skip_threshold": SKIP_VOTE_THRESHOLD,
+                    "skipped": will_skip})
+
+
+@app.route("/history/<item_id>/requeue", methods=["POST"])
+def route_requeue(item_id):
+    """Puts a previously-played (or previously-failed) track back on the
+    queue — goes through _enqueue_track exactly like a fresh request, so
+    it's a real new item (its own id, its own download if it's not still
+    sitting in Navidrome) rather than trying to reuse anything from the
+    old one."""
+    with state_lock:
+        hist_item = next((h for h in state["history"] if h["id"] == item_id), None)
+    if not hist_item:
+        return jsonify({"error": "Not found"}), 404
+    session_id = request.headers.get("X-Jam-Session", "")
+    data = request.json or {}
+    requested_by = data.get("requested_by") or hist_item.get("requested_by") or "Anonymous"
+
+    item, err = _enqueue_track(
+        hist_item["video_id"], hist_item["url"], hist_item["title"], hist_item["artist"],
+        duration=hist_item.get("duration"), thumbnail=hist_item.get("thumbnail"),
+        known_album=hist_item.get("album") or hist_item.get("known_album") or "",
+        requested_by=requested_by, session_id=session_id)
+    if err:
+        message, status = err
+        return jsonify({"error": message}), status
+    return jsonify(public_view(item, session_id=session_id))
 
 
 @app.route("/queue/<item_id>/remove", methods=["POST"])
@@ -1097,6 +1233,11 @@ def route_queue_remove(item_id):
 def route_player_state():
     with state_lock:
         now_playing = find_item(state["now_playing_id"]) if state["now_playing_id"] else None
+        upcoming = sorted((i for i in state["queue"] if i["status"] != "playing"), key=_queue_sort_key)[:10]
+        # Only the very next ("on deck") item needs its stream_url — that's
+        # the one the player page preloads into its second <audio> element
+        # to crossfade into, well before the current track actually ends.
+        up_next = [public_view(i, include_stream=(j == 0)) for j, i in enumerate(upcoming)]
         return jsonify({
             "now_playing": public_view(now_playing, include_stream=True) if now_playing else None,
             "playback_started_at": state["playback_started_at"],
@@ -1104,7 +1245,7 @@ def route_player_state():
             "pause_started_at": state["pause_started_at"],
             "autoplay_enabled": state.get("autoplay_enabled", True),
             "autofill_in_progress": _autofill_running,
-            "up_next": [public_view(i) for i in state["queue"] if i["status"] != "playing"][:10],
+            "up_next": up_next,
         })
 
 

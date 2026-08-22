@@ -199,7 +199,11 @@ volSlider.addEventListener('input', () => {
   localStorage.setItem('jam_volume', volSlider.value);
   updateMuteIcon();
 });
-function toggleMute(){ audio.muted = !audio.muted; updateMuteIcon(); }
+function toggleMute(){
+  audio.muted = !audio.muted;
+  if(crossfadeActive) preloadEl.muted = audio.muted;
+  updateMuteIcon();
+}
 updateMuteIcon();
 
 // ── Playback / autoplay unlock ──────────────────────────────────────────
@@ -221,6 +225,124 @@ function tryPlay(){
   }
 }
 
+// ── Crossfade ─────────────────────────────────────────────────────────────
+// A second, plain <audio> element — never routed through
+// createMediaElementSource, so it just plays through the browser's normal
+// output alongside the first, the same way any two concurrent <audio>
+// elements on a page mix. It gets preloaded with whatever's "on deck" well
+// before the current track ends (the backend already tries to have it
+// downloaded ahead of time — see Auto DJ's prefetch), and once the current
+// track is within CROSSFADE_SEC of ending, both play together while volume
+// ramps between them. At the end of the ramp, #audio itself takes over the
+// new track (seeking to wherever the preload buffer had reached) so it
+// stays the one element the visualizer/volume/mute code ever has to deal
+// with, rather than needing a second Web Audio chain — a deliberate
+// simplification given how many rounds of real bugs the graph in this
+// exact file has already caused. The one cost: a brief (well under a
+// second) handoff blip as #audio catches up, traded for never touching the
+// existing analyser/graph wiring at all.
+const CROSSFADE_SEC = 4;
+const preloadEl = document.createElement('audio');
+preloadEl.volume = 0;
+document.body.appendChild(preloadEl);
+
+let preloadedNextId = null;
+let preloadedNextItem = null; // its title/artist/thumbnail/duration — the
+                               // crossfade path updates the display from
+                               // this directly, since it skips the normal
+                               // "new track" branch that otherwise would
+let crossfadeActive = false;
+let pendingNextId = null;   // set the moment a crossfade starts — the id
+                             // render() should treat as "already arriving
+                             // locally", not a fresh track to load from 0
+
+function maybePreloadNext(upNext){
+  const next = (upNext || [])[0];
+  // Only once it's actually 'ready' — anything earlier has no local file
+  // yet, and /api/stream/<id> would just 404.
+  if(!next || !next.stream_url || next.status !== 'ready' || next.id === preloadedNextId) return;
+  preloadedNextId = next.id;
+  preloadedNextItem = next;
+  preloadEl.src = next.stream_url;
+  preloadEl.load();
+}
+
+function crossfadeReady(){
+  return !!preloadEl.src && preloadEl.readyState >= 3; // HAVE_FUTURE_DATA+
+}
+
+function maybeStartCrossfade(){
+  if(crossfadeActive || jamPaused) return;
+  if(!audio.duration || !isFinite(audio.duration) || audio.duration < CROSSFADE_SEC * 2) return;
+  if(audio.duration - audio.currentTime > CROSSFADE_SEC) return;
+  if(!crossfadeReady()) return;
+  startCrossfade();
+}
+
+function startCrossfade(){
+  crossfadeActive = true;
+  pendingNextId = preloadedNextId;
+  // render() skips its usual "new track" DOM update for whatever's
+  // arriving via an in-flight crossfade (touching audio.src there would
+  // wreck the ramp) — so this is the one place that actually happens for
+  // a crossfaded track, right as the transition visually begins.
+  if(preloadedNextItem){
+    const nxt = preloadedNextItem;
+    document.getElementById('art').src = nxt.thumbnail || '';
+    document.getElementById('title').textContent = nxt.title;
+    document.getElementById('artist').textContent = nxt.artist;
+    document.getElementById('req').textContent = `requested by ${nxt.requested_by}`;
+    document.getElementById('t-total').textContent = fmt(nxt.duration);
+  }
+  const userVol = audio.volume;
+  preloadEl.currentTime = 0;
+  preloadEl.muted = audio.muted;
+  preloadEl.volume = 0;
+  preloadEl.play().catch(()=>{});
+  requestAdvance(); // tells the server to move on now, in step with the fade starting
+
+  const startedAt = performance.now();
+  (function tick(){
+    if(!crossfadeActive) return; // aborted (e.g. someone paused mid-fade)
+    const t = Math.min(1, (performance.now() - startedAt) / (CROSSFADE_SEC * 1000));
+    audio.volume = userVol * (1 - t);
+    preloadEl.volume = userVol * t;
+    if(t < 1) requestAnimationFrame(tick);
+    else finishCrossfade();
+  })();
+}
+
+function finishCrossfade(){
+  const handoffAt = preloadEl.currentTime;
+  preloadEl.pause();
+  audio.src = preloadEl.src;
+  audio.addEventListener('loadedmetadata', function seekOnce(){
+    audio.currentTime = handoffAt;
+    audio.volume = volSlider.value / 100; // back to the real slider value, not the ramp's last step
+    audio.muted = false;
+    if(!jamPaused) tryPlay();
+  }, {once: true});
+  preloadEl.removeAttribute('src');
+  preloadedNextId = null;
+  preloadedNextItem = null;
+  currentId = pendingNextId;
+  pendingNextId = null;
+  crossfadeActive = false;
+}
+
+// Bails out of an in-flight fade without finishing it — used when the
+// server ends up somewhere other than where the fade was already headed
+// (a vote reshuffle, a skip from another session, landing mid-ramp).
+function abortCrossfade(){
+  crossfadeActive = false;
+  pendingNextId = null;
+  try{ preloadEl.pause(); }catch(e){}
+  preloadEl.volume = 0;
+  audio.volume = volSlider.value / 100;
+}
+
+audio.addEventListener('timeupdate', maybeStartCrossfade);
+
 // ── Pause (global — one shared jam, same state for everyone watching) ───
 // There is exactly one real queue/player; pausing here pauses it for
 // every open player page, and the button always reflects the server's
@@ -235,7 +357,13 @@ function togglePause(){
   // (within ~1s) reconciles this with the real server state regardless,
   // including for every *other* open player page watching the same jam.
   jamPaused = !jamPaused;
-  if(jamPaused) audio.pause(); else tryPlay();
+  if(jamPaused){
+    audio.pause();
+    if(crossfadeActive) preloadEl.pause();
+  } else {
+    tryPlay();
+    if(crossfadeActive) preloadEl.play().catch(()=>{});
+  }
   updatePauseIcon();
 }
 
@@ -313,7 +441,17 @@ function render(d){
   if(np){
     jamPaused = !!d.paused;
     updatePauseIcon();
+    // A crossfade already under way toward some *other* track than what
+    // the server now reports (a reshuffle, or a skip from another
+    // session, landing mid-fade) — bail out of it cleanly first, rather
+    // than let the reload below fight with an in-flight volume ramp.
+    if(crossfadeActive && np.id !== pendingNextId && np.id !== currentId) abortCrossfade();
     if(np.id !== currentId){
+      if(np.id === pendingNextId){
+        // Already mid-crossfade into exactly this track on the client
+        // side — its own tick()/finishCrossfade() is handling everything;
+        // touching audio.src here would wreck the ramp in progress.
+      } else {
       currentId = np.id;
       document.getElementById('art').src = np.thumbnail || '';
       document.getElementById('title').textContent = np.title;
@@ -329,11 +467,12 @@ function render(d){
         audio.currentTime = elapsed;
         if(!jamPaused) tryPlay();
       }, {once: true});
-    } else if(jamPaused && !audio.paused){
+      }
+    } else if(jamPaused && !audio.paused && !crossfadeActive){
       // Someone else's session (or this one, a moment ago) paused the
       // shared jam — bring this <audio> element in line with that.
       audio.pause();
-    } else if(!jamPaused && audio.paused && audio.src){
+    } else if(!jamPaused && audio.paused && audio.src && !crossfadeActive){
       tryPlay();
     }
 
@@ -348,12 +487,18 @@ function render(d){
     const pct = np.duration ? Math.min(100, elapsed/np.duration*100) : 0;
     document.getElementById('bar-fill').style.width = pct + '%';
     document.getElementById('t-elapsed').textContent = fmt(elapsed);
-  } else {
+  } else if(!crossfadeActive){
+    // Guarded by !crossfadeActive: a poll landing in the brief window
+    // between the server advancing and it actually promoting the next
+    // ready item would otherwise report "nothing playing" for a moment
+    // and rip out an in-flight crossfade's audio.src out from under it.
     currentId = null;
     jamPaused = false;
     audio.pause();
     audio.removeAttribute('src');
   }
+
+  maybePreloadNext(d.up_next);
 
   const un = document.getElementById('up-next');
   un.innerHTML = (d.up_next || []).slice(0, 6).map(i => `
