@@ -671,6 +671,18 @@ _autofill_next_attempt_at = 0      # backoff after a fruitless attempt, so a
 
 AUTOFILL_COOLDOWN_SEC = 20
 AUTOFILL_HISTORY_AVOID = 25  # don't re-suggest anything played this recently
+# Auto DJ runs unattended, indefinitely, for as long as nobody's actively
+# steering the jam — with no cap of its own, that's an unbounded download
+# loop syncing a fresh file into the Navidrome library every time it
+# fires. Over days of a quiet jam nobody was watching, that alone added
+# ~19GB (285 tracks) to a library that turned out to already be sitting
+# near capacity, and was enough to actually fill the disk solid — at
+# which point Navidrome couldn't write *anything* (its own DB, its own
+# transcode cache), which looked exactly like "every track just skips"
+# from the outside, because it effectively was: nothing could actually
+# stream. A human requesting songs is inherently self-limiting; this
+# background loop isn't, so it gets its own explicit guard instead.
+MIN_FREE_DISK_GB_FOR_AUTOFILL = 5
 
 
 def _autofill_seed_video_id():
@@ -689,6 +701,25 @@ def _autofill_seed_video_id():
     return None
 
 
+def _navidrome_host_free_gb():
+    """Best-effort free space (GB) on the Navidrome host's music
+    filesystem. Returns None if the check itself fails for any reason
+    (SSH hiccup, not configured, etc.) — callers should treat that as
+    'unknown, don't block on it', not as 'definitely full'; this is a
+    guard against Auto DJ's own unattended growth, not a general-purpose
+    health check that should ever stop a real human's request."""
+    if not (SSH_HOST and SSH_USER):
+        return None
+    try:
+        cmd = _ssh_cmd(f"df --output=avail -B1 {shlex.quote(SSH_MUSIC_PATH)} | tail -1")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return None
+        return int(result.stdout.strip()) / (1024 ** 3)
+    except Exception:
+        return None
+
+
 def maybe_trigger_autofill():
     """Cheap check called from the watchdog loop every couple of seconds;
     the actual network-bound work only happens in a spawned thread, and
@@ -702,7 +733,7 @@ def maybe_trigger_autofill():
     "no upcoming item" instead lets it prefetch and download the next
     pick *while* the current one is still playing, so it's usually
     already sitting there ready by the time it's actually needed."""
-    global _autofill_running
+    global _autofill_running, _autofill_next_attempt_at
     with state_lock:
         if not state.get("autoplay_enabled", True):
             return
@@ -711,6 +742,13 @@ def maybe_trigger_autofill():
             return
         seed = _autofill_seed_video_id()
     if not seed or time.time() < _autofill_next_attempt_at:
+        return
+    free_gb = _navidrome_host_free_gb()
+    if free_gb is not None and free_gb < MIN_FREE_DISK_GB_FOR_AUTOFILL:
+        print(f"[jam] Auto DJ paused — only {free_gb:.1f}GB free on the Navidrome host "
+              f"(need {MIN_FREE_DISK_GB_FOR_AUTOFILL}GB); a real request will still go through.",
+              file=sys.stderr)
+        _autofill_next_attempt_at = time.time() + AUTOFILL_COOLDOWN_SEC * 15  # check back in ~5 min, not every 20s
         return
     if not _autofill_lock.acquire(blocking=False):
         return
