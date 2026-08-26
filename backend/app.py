@@ -457,6 +457,21 @@ def maybe_correct_album(flac_path, title, artist, album, playlist_name, source_u
 
 _ytmusic_client = None
 _ytmusic_disabled = False
+# gunicorn here is one process with many threads (--workers 1 --threads 16
+# — deliberately: the whole queue/playback state lives in this one
+# process's memory, so more worker *processes* would each get their own
+# disconnected copy of it). That means this client, and whatever HTTP
+# session ytmusicapi keeps internally, is genuinely shared across every
+# concurrent request. Auto DJ's background thread calls into it completely
+# independently of (and now, with autofill running roughly every 2-20s,
+# increasingly likely to overlap with) a manual /search request's own
+# thread — unsynchronized concurrent use of that shared session was
+# segfaulting the entire process (every open connection, including
+# whatever anyone was actively listening to, dropped at once — "skips
+# every track" from the outside), not just raising an ordinary, catchable
+# Python exception. Held around both construction and every actual call
+# into the client.
+_ytmusic_lock = threading.Lock()
 
 def _get_ytmusic():
     """Lazily construct a shared YTMusic client, matching Spotidrome's own
@@ -466,14 +481,15 @@ def _get_ytmusic():
     global _ytmusic_client, _ytmusic_disabled
     if _ytmusic_disabled:
         return None
-    if _ytmusic_client is None:
-        try:
-            _ytmusic_client = YTMusic()
-        except Exception as e:
-            print(f"[jam] YTMusic init failed, disabling: {e}", file=sys.stderr)
-            _ytmusic_disabled = True
-            return None
-    return _ytmusic_client
+    with _ytmusic_lock:
+        if _ytmusic_client is None:
+            try:
+                _ytmusic_client = YTMusic()
+            except Exception as e:
+                print(f"[jam] YTMusic init failed, disabling: {e}", file=sys.stderr)
+                _ytmusic_disabled = True
+                return None
+        return _ytmusic_client
 
 def _search_ytmusic_songs(query, limit, timeout=12):
     """YouTube Music's own 'songs' category — YouTube's own classification
@@ -488,8 +504,9 @@ def _search_ytmusic_songs(query, limit, timeout=12):
         return []
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(ytm.search, query, filter="songs", limit=limit)
-        results = future.result(timeout=timeout)
+        with _ytmusic_lock:  # serialize against every other caller of ytm — see _ytmusic_lock above
+            future = executor.submit(ytm.search, query, filter="songs", limit=limit)
+            results = future.result(timeout=timeout)
     except Exception:
         return []
     finally:
@@ -610,8 +627,9 @@ def get_similar_tracks(seed_video_id, limit=20, timeout=12):
         return []
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(ytm.get_watch_playlist, videoId=seed_video_id, limit=limit)
-        result = future.result(timeout=timeout)
+        with _ytmusic_lock:  # serialize against every other caller of ytm — see _ytmusic_lock above
+            future = executor.submit(ytm.get_watch_playlist, videoId=seed_video_id, limit=limit)
+            result = future.result(timeout=timeout)
     except Exception as e:
         print(f"[jam] get_watch_playlist failed for seed {seed_video_id}: {e}", file=sys.stderr)
         return []
