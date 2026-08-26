@@ -62,9 +62,10 @@ Both talk to the same Flask backend, which:
 3. Plays it **immediately from that local download** the moment it's
    ready — it does not wait on Navidrome.
 4. Separately, in the background, rsyncs a copy into the Navidrome
-   library (under a `Jam/` folder) and triggers a scan, purely so the
-   track ends up archived permanently. This never blocks or delays
-   playback.
+   library (under a `Jam/` folder) and triggers a scan, so it's there
+   to play again without a re-download for a while. This never blocks
+   or delays playback. `Jam/` is a rolling window, not permanent
+   storage — see **Jam/ folder cleanup** below.
 5. Refuses to add a song that's already sitting in the queue (or currently
    playing) a second time.
 6. Separately checks Navidrome's own library (via its Subsonic API) for a
@@ -100,6 +101,27 @@ at once, they all show (and play) the exact same state; there's no
 "individual session" behind any of it. Reloading the page (or resuming
 from pause) picks up wherever the shared timeline currently is rather
 than restarting the track from 0:00.
+
+## Jam/ folder cleanup
+
+Every played track gets synced into `Jam/` on the Navidrome host so it's
+there to play again without a re-download. Left unchecked that's an
+unbounded download loop — a jam left running unattended (Auto DJ) adds to
+it indefinitely, and that's exactly what filled a real Navidrome host's
+disk solid once already (Auto DJ itself now also checks free space
+before adding anything further — see **Auto DJ** above — but that only
+stops things from getting *worse*, it doesn't reclaim anything already
+there).
+
+A background job checks every 6 hours and deletes the *oldest* files in
+`Jam/` until it's back under 5GB total, then removes the now-stale
+Navidrome library entries directly (a scan alone doesn't reliably prune
+an entry for a file that just vanished off disk — same lesson learned
+fixing Spotidrome's own library-maintenance jobs) and triggers a rescan.
+`Jam/` is a rolling window this way, not permanent storage — a track
+still played from the local download the moment it's requested either
+way, this only affects whether an *old* jam track is still sitting there
+to stream again later without a fresh download.
 
 ## Crossfade
 

@@ -900,8 +900,12 @@ def _ssh_cmd(remote_command):
 
 
 def sync_to_navidrome_bg(item):
-    """Best-effort archival copy into the permanent library — never blocks
-    or affects playback, which already streams from the local download."""
+    """Best-effort archival copy into the Jam/ folder — never blocks or
+    affects playback, which already streams from the local download.
+    Jam/ is a *rolling* archive, not permanent storage — see
+    cleanup_jam_folder below; a jam left running unattended (Auto DJ)
+    downloads indefinitely, and without a cap this is exactly what
+    filled the Navidrome host's disk solid once already."""
     if not (SSH_HOST and SSH_USER):
         return
     try:
@@ -918,6 +922,88 @@ def sync_to_navidrome_bg(item):
                       auth=(NAVIDROME_USER, NAVIDROME_PASSWORD), timeout=15)
     except Exception as e:
         print(f"[jam] Navidrome sync failed for {item['id']}: {e}", flush=True)
+
+
+# ─── Jam/ folder cleanup ─────────────────────────────────────────────────────
+# Every played track gets rsynced into Jam/ (see sync_to_navidrome_bg above)
+# with nothing bounding how much accumulates — over days of Auto DJ running
+# unattended, that's an unbounded download loop, and it's what actually
+# filled the Navidrome host's disk solid once already (Auto DJ now checks
+# free space before adding anything more — see MIN_FREE_DISK_GB_FOR_AUTOFILL
+# — but that only stops it from getting *worse*; it doesn't reclaim
+# anything already there, and normal human requests aren't capped at all
+# either). This keeps Jam/ itself under a fixed size going forward,
+# deleting the oldest files first once over — a rolling window rather than
+# permanent storage.
+
+JAM_FOLDER_MAX_BYTES = 5 * 1024 ** 3  # 5GB
+JAM_CLEANUP_INTERVAL_SEC = 6 * 3600   # check every 6 hours
+NAVIDROME_DB_PATH = "/var/lib/navidrome/navidrome.db"
+
+
+def cleanup_jam_folder():
+    """Deletes the oldest files in Jam/ until it's back under
+    JAM_FOLDER_MAX_BYTES, then removes the Navidrome DB rows for exactly
+    the files just deleted — a plain rescan doesn't reliably prune a row
+    whose file just vanished out from under it here (the same lesson
+    Spotidrome's own dedupe jobs learned the hard way), only a direct
+    delete does — and triggers a rescan. Best-effort throughout: any
+    failure just means trying again next interval, never something that
+    should affect playback."""
+    if not (SSH_HOST and SSH_USER):
+        return
+    remote_dir = f"{SSH_MUSIC_PATH}/{NAV_SUBFOLDER}"
+    try:
+        list_cmd = _ssh_cmd(f"find {shlex.quote(remote_dir)} -maxdepth 1 -name '*.flac' "
+                             f"-printf '%T@ %s %f\\n' 2>/dev/null")
+        result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return
+        files = []
+        for line in result.stdout.splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                files.append((float(parts[0]), int(parts[1]), parts[2]))
+            except ValueError:
+                continue
+        files.sort(key=lambda f: f[0])  # oldest first
+
+        total = sum(f[1] for f in files)
+        to_delete = []
+        freed = 0
+        while total > JAM_FOLDER_MAX_BYTES and files:
+            _mtime, size, fname = files.pop(0)
+            to_delete.append(fname)
+            total -= size
+            freed += size
+        if not to_delete:
+            return
+
+        quoted_paths = " ".join(shlex.quote(f"{remote_dir}/{f}") for f in to_delete)
+        subprocess.run(_ssh_cmd(f"rm -f -- {quoted_paths}"), capture_output=True, timeout=30)
+        print(f"[jam] Cleaned up {len(to_delete)} old Jam/ file(s), freed ~{freed / 1024**2:.0f}MB", flush=True)
+
+        # Direct DB delete for exactly the files just removed — see the
+        # docstring above for why a scan alone isn't enough here.
+        conditions = " OR ".join(
+            "path = '{}/{}'" .format(NAV_SUBFOLDER, fn.replace("'", "''")) for fn in to_delete)
+        sql = f"DELETE FROM media_file WHERE {conditions};"
+        subprocess.run(_ssh_cmd(f"sqlite3 {NAVIDROME_DB_PATH} {shlex.quote(sql)}"),
+                        capture_output=True, timeout=20)
+
+        if NAVIDROME_URL and NAVIDROME_USER:
+            http.put(f"{NAVIDROME_URL}/api/scanner/trigger",
+                      auth=(NAVIDROME_USER, NAVIDROME_PASSWORD), params={"fullScan": "true"}, timeout=15)
+    except Exception as e:
+        print(f"[jam] Jam/ cleanup failed: {e}", flush=True)
+
+
+def jam_cleanup_loop():
+    while True:
+        cleanup_jam_folder()
+        time.sleep(JAM_CLEANUP_INTERVAL_SEC)
 
 
 # ─── Queue engine ────────────────────────────────────────────────────────────
@@ -1314,6 +1400,16 @@ def route_player_autoplay():
         return jsonify({"autoplay_enabled": state["autoplay_enabled"]})
 
 
+@app.route("/library/jam-cleanup", methods=["POST"])
+def route_jam_cleanup():
+    """Manual trigger for the same Jam/ size-cap cleanup the background
+    loop runs every few hours — mainly for checking it actually works,
+    or forcing an immediate reclaim without waiting for the next
+    interval."""
+    threading.Thread(target=cleanup_jam_folder, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @app.route("/player/advance", methods=["POST"])
 def route_player_advance():
     data = request.json or {}
@@ -1474,6 +1570,7 @@ for f in glob.glob(os.path.join(DOWNLOAD_DIR, "**", "*.flac"), recursive=True):
             pass
 threading.Thread(target=download_worker_loop, daemon=True).start()
 threading.Thread(target=watchdog_loop, daemon=True).start()
+threading.Thread(target=jam_cleanup_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
