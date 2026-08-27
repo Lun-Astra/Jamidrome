@@ -219,7 +219,7 @@ async function refreshQueue(){
     if(d.now_playing){
       const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
       const pct = d.now_playing.duration ? Math.min(100, elapsed/d.now_playing.duration*100) : 0;
-      const sv = d.now_playing.skip_votes || 0, st = d.now_playing.skip_threshold || 3;
+      const sv = d.now_playing.skip_votes || 0, st = d.now_playing.skip_threshold || 1;
       np.innerHTML = `
         <img src="${esc(d.now_playing.thumbnail)}">
         <div style="flex:1;min-width:0">

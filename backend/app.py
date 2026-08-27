@@ -57,10 +57,10 @@ MAX_HISTORY         = 50
 ADVANCE_BUFFER_SEC   = 5     # grace period added on top of a track's own duration
                              # before the server auto-advances without a client signal
 SEARCH_RESULT_COUNT  = 10
-SKIP_VOTE_THRESHOLD  = 3     # no accounts/presence tracking to compute a real
-                             # quorum against, so this is a fixed, small "enough
-                             # people are annoyed" bar rather than a majority
-                             # of anything actually counted.
+SKIP_VOTE_THRESHOLD  = 1     # a single vote skips — no accounts/presence
+                             # tracking to compute a real quorum against, and
+                             # requiring several people to agree was more
+                             # friction than the feature was worth.
 # Set when the request/player pages sit behind a reverse proxy on separate
 # hostnames (e.g. jam.example.com / aanvragenjam.example.com) rather than
 # being reached directly on :9999/:9998 — there's no way to derive one
