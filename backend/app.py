@@ -783,8 +783,24 @@ def _run_autofill(seed_video_id):
         with state_lock:
             avoid_ids = {i["video_id"] for i in state["history"][-AUTOFILL_HISTORY_AVOID:] if i.get("video_id")}
             avoid_ids |= {i["video_id"] for i in state["queue"]}
+            older_history = [i["video_id"] for i in state["history"][:-AUTOFILL_HISTORY_AVOID]
+                              if i.get("video_id")]
         candidates = get_similar_tracks(seed_video_id, limit=20)
         pick = next((c for c in candidates if c["video_id"] not in avoid_ids), None)
+        # The seed is always "whatever's playing/just played" — over a long
+        # unattended jam, that one seed's ~20 "similar tracks" can all end
+        # up already recently played, and since the seed itself doesn't
+        # change between attempts, retrying just keeps re-fetching the
+        # exact same exhausted pool every 20s forever rather than actually
+        # finding anything new. Falling back to a *different* seed pulled
+        # from further back in history (still real history, just old
+        # enough to be outside the recent-repeat window) gives it a fresh
+        # pool to draw from instead of getting stuck.
+        if not pick and older_history:
+            fallback_seed = secrets.choice(older_history)
+            if fallback_seed != seed_video_id:
+                fallback_candidates = get_similar_tracks(fallback_seed, limit=20)
+                pick = next((c for c in fallback_candidates if c["video_id"] not in avoid_ids), None)
         if not pick:
             _autofill_next_attempt_at = time.time() + AUTOFILL_COOLDOWN_SEC
             return
