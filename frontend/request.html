@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Jamidrome — Request a song</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -14,8 +14,18 @@
   --r:10px;--r2:14px;--font:'Inter',sans-serif;--font2:'Space Grotesk',sans-serif;
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
-.app{max-width:720px;margin:0 auto;padding:20px 16px 80px}
+/* overflow-x:hidden is a safety net, not the fix for anything specific —
+   on a phone, ANY element even 1px wider than the viewport (a stray
+   fixed width, a box-sizing slip) shifts the whole page sideways and
+   leaves a permanent horizontal scrollbar, which reads as "the layout
+   is broken" even when every individual component is otherwise fine. */
+html{overflow-x:hidden}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;min-height:100dvh;overflow-x:hidden}
+/* Bottom padding covers both the fixed toast popup and, on notched
+   iPhones, the home-indicator swipe area the content would otherwise
+   sit flush against (and get partly obscured by). Top padding does the
+   same for the status bar / Dynamic Island. */
+.app{max-width:720px;margin:0 auto;padding:max(20px,env(safe-area-inset-top)) 16px calc(80px + env(safe-area-inset-bottom))}
 header{display:flex;align-items:center;justify-content:space-between;padding:8px 0 20px;flex-wrap:wrap;gap:10px}
 .logo{font-family:var(--font2);font-size:22px;font-weight:700;letter-spacing:-0.5px}
 .logo .j{color:var(--sp)}.logo .arr{color:var(--text3);margin:0 3px;font-weight:400}.logo .d{color:var(--nd)}

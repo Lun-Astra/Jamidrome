@@ -57,10 +57,6 @@ MAX_HISTORY         = 50
 ADVANCE_BUFFER_SEC   = 5     # grace period added on top of a track's own duration
                              # before the server auto-advances without a client signal
 SEARCH_RESULT_COUNT  = 10
-MAX_PENDING_PER_SESSION = 3  # a request not yet played counts as "pending" —
-                             # caps how much of the queue one browser can hold
-                             # at once so nobody can monopolize it. Auto DJ's
-                             # own picks have no session_id and are exempt.
 SKIP_VOTE_THRESHOLD  = 3     # no accounts/presence tracking to compute a real
                              # quorum against, so this is a fixed, small "enough
                              # people are annoyed" bar rather than a majority
@@ -1242,17 +1238,6 @@ def _enqueue_track(video_id, url, title, artist, duration=None, thumbnail="",
         active_ids = {i["video_id"] for i in state["queue"] if i["status"] in ("queued", "downloading", "ready", "playing")}
         if video_id in active_ids:
             return None, ("That song is already in the queue", 409)
-
-        # A "pending" request is one that hasn't played yet — caps how much
-        # of the queue any one browser can hold at once, so nobody can
-        # monopolize it. Auto DJ's own picks (session_id=None) are exempt,
-        # and a track already playing no longer counts as pending.
-        if session_id:
-            pending = sum(1 for i in state["queue"]
-                          if i.get("session_id") == session_id and i["status"] in ("queued", "downloading", "ready"))
-            if pending >= MAX_PENDING_PER_SESSION:
-                return None, (f"You already have {MAX_PENDING_PER_SESSION} songs waiting — "
-                               f"wait for one of them to play first", 429)
 
         item = {
             "id": uuid.uuid4().hex[:12],

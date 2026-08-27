@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Jamidrome</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -20,7 +20,14 @@ body::before{content:'';position:fixed;inset:0;
     radial-gradient(circle at 85% 85%, rgba(139,92,246,.07) 0%, transparent 45%);
   pointer-events:none}
 
-.stage{position:relative;z-index:1;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px;text-align:center}
+/* 100vh is the LARGEST possible viewport on mobile Safari — it doesn't
+   shrink for the address bar, so with overflow:hidden above, content
+   pinned near the bottom (up-next row, audio-unlock button) can end up
+   genuinely clipped behind the browser chrome with no way to scroll to
+   it. 100dvh tracks the real, current viewport instead; the plain
+   100vh line stays first as the fallback for browsers that don't know
+   dvh (the second declaration simply wins wherever it's supported). */
+.stage{position:relative;z-index:1;height:100vh;height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px;text-align:center}
 .logo{position:fixed;top:24px;left:32px;font-family:var(--font2);font-size:17px;font-weight:700;letter-spacing:-.5px;opacity:.6}
 .logo .j{color:var(--sp)}.logo .arr{color:var(--text3);margin:0 3px;font-weight:400}.logo .d{color:var(--nd)}
 
@@ -67,6 +74,33 @@ body::before{content:'';position:fixed;inset:0;
 #audio-unlock{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);display:none;
   background:var(--sp);color:#06210f;border:none;border-radius:24px;padding:12px 24px;
   font-size:14px;font-weight:700;cursor:pointer;z-index:15;box-shadow:0 10px 30px rgba(0,0,0,.4)}
+
+/* .top-right's four controls (volume, pause, skip, Auto DJ) add up to
+   roughly 450px of un-wrapping fixed-position content — nowhere close
+   to fitting a ~375px phone screen. With no left bound, the overflow
+   just pushes off the left edge of the viewport, and overflow:hidden
+   above then clips it there rather than letting it scroll into view —
+   the buttons end up unreachable rather than merely ugly. Below this
+   breakpoint: let it wrap onto a second line and shrink to fit, add
+   safe-area padding for the iPhone notch/Dynamic Island, and give the
+   centered stage content enough top/bottom padding to clear both this
+   (now taller) bar and the up-next row instead of sitting behind them. */
+@media (max-width: 640px){
+  .logo{top:max(14px,env(safe-area-inset-top));left:max(16px,env(safe-area-inset-left));font-size:14px}
+  .top-right{top:max(14px,env(safe-area-inset-top));right:max(16px,env(safe-area-inset-right));
+    left:max(16px,env(safe-area-inset-left));flex-wrap:wrap;justify-content:flex-end;gap:8px}
+  .vol-ctrl{padding:6px 10px}
+  .vol-ctrl input[type=range]{width:64px}
+  #skip-btn,#pause-btn,#autodj-btn{padding:6px 12px;font-size:11px}
+  #invite-btn{top:max(58px,calc(env(safe-area-inset-top) + 48px));left:max(16px,env(safe-area-inset-left));
+    padding:6px 12px;font-size:11px}
+  .stage{padding:96px 20px 120px}
+  .art-wrap{width:min(34vh,220px);height:min(34vh,220px);margin-bottom:20px}
+  #viz{height:60px}
+  .up-next{bottom:max(16px,env(safe-area-inset-bottom));padding:0 16px}
+  .un-item{max-width:150px}
+  #audio-unlock{bottom:max(16px,env(safe-area-inset-bottom))}
+}
 
 #viz{width:min(70vw,520px);height:90px;margin:18px auto 0;display:block}
 
@@ -225,6 +259,62 @@ function tryPlay(){
   }
 }
 
+// ── CarPlay / background-audio reliability ───────────────────────────────
+// The visualizer needs the <audio> element's output routed through a Web
+// Audio AudioContext (see setupAudioGraph below) — but iOS Safari treats
+// an AudioContext very differently from a plain <audio> element once the
+// screen locks, the app backgrounds, or CarPlay/Bluetooth briefly steals
+// the audio route (a call, Siri, a route change): it silently suspends
+// the whole context. audio.play() still resolves fine and playback
+// *looks* fine from JS's point of view — there's just no sound, because
+// every node hanging off the suspended context (including the one
+// carrying the actual output) has gone quiet. That's exactly "plays
+// perfectly, then randomly goes silent until I open the phone again" —
+// opening the app is the user gesture that finally lets a resume() call
+// through. Two things reduce how often that happens and how long it
+// lasts:
+//
+// 1. Catch it as fast as possible: resume on every visibility/focus
+//    change, not just at explicit track boundaries — the instant the
+//    phone is opened again, not on the next poll tick.
+// 2. Media Session API metadata + action handlers give iOS a real
+//    "Now Playing" session to hang onto, which is what actually makes
+//    Safari treat this tab as legitimate background audio in the first
+//    place (undocumented in detail, but well established in practice) —
+//    and it's also what puts proper title/artist and working play/pause/
+//    skip controls on the CarPlay/lock-screen Now Playing UI instead of
+//    a bare "unknown title" with no controls at all.
+function resumeAudioAndRetry(){
+  if(audioCtx && audioCtx.state === 'suspended'){
+    audioCtx.resume().catch(()=>{});
+  }
+  if(!jamPaused && audio.src && audio.paused){
+    tryPlay();
+  }
+  if(crossfadeActive && preloadEl.paused){
+    preloadEl.play().catch(()=>{});
+  }
+}
+document.addEventListener('visibilitychange', () => { if(!document.hidden) resumeAudioAndRetry(); });
+window.addEventListener('pageshow', resumeAudioAndRetry);
+window.addEventListener('focus', resumeAudioAndRetry);
+
+function updateMediaSession(np){
+  if(!('mediaSession' in navigator)) return;
+  if(!np){ navigator.mediaSession.metadata = null; navigator.mediaSession.playbackState = 'none'; return; }
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: np.title || 'Unknown title',
+    artist: np.artist || '',
+    artwork: np.thumbnail ? [{src: np.thumbnail, sizes: '512x512', type: 'image/jpeg'}] : [],
+  });
+  navigator.mediaSession.playbackState = jamPaused ? 'paused' : 'playing';
+}
+if('mediaSession' in navigator){
+  navigator.mediaSession.setActionHandler('play', () => { if(jamPaused) togglePause(); });
+  navigator.mediaSession.setActionHandler('pause', () => { if(!jamPaused) togglePause(); });
+  navigator.mediaSession.setActionHandler('nexttrack', () => skip());
+}
+
 // ── Crossfade ─────────────────────────────────────────────────────────────
 // A second, plain <audio> element — never routed through
 // createMediaElementSource, so it just plays through the browser's normal
@@ -293,6 +383,7 @@ function startCrossfade(){
     document.getElementById('artist').textContent = nxt.artist;
     document.getElementById('req').textContent = `requested by ${nxt.requested_by}`;
     document.getElementById('t-total').textContent = fmt(nxt.duration);
+    updateMediaSession(nxt);
   }
   const userVol = audio.volume;
   preloadEl.currentTime = 0;
@@ -365,6 +456,7 @@ function togglePause(){
     if(crossfadeActive) preloadEl.play().catch(()=>{});
   }
   updatePauseIcon();
+  if('mediaSession' in navigator) navigator.mediaSession.playbackState = jamPaused ? 'paused' : 'playing';
 }
 
 // ── Auto DJ ──────────────────────────────────────────────────────────────
@@ -436,11 +528,13 @@ function render(d){
       big.textContent = 'Waiting for requests…';
       hint.style.display = 'block';
     }
+    updateMediaSession(null);
   }
 
   if(np){
     jamPaused = !!d.paused;
     updatePauseIcon();
+    if('mediaSession' in navigator) navigator.mediaSession.playbackState = jamPaused ? 'paused' : 'playing';
     // A crossfade already under way toward some *other* track than what
     // the server now reports (a reshuffle, or a skip from another
     // session, landing mid-fade) — bail out of it cleanly first, rather
@@ -458,6 +552,7 @@ function render(d){
       document.getElementById('artist').textContent = np.artist;
       document.getElementById('req').textContent = `requested by ${np.requested_by}`;
       document.getElementById('t-total').textContent = fmt(np.duration);
+      updateMediaSession(np);
       // Seek to wherever the shared timeline already is — this is a fresh
       // <audio> load (new track, or this page just loaded/reloaded mid-
       // track), so without this it would always start over from 0:00.
@@ -618,6 +713,14 @@ function setupAudioGraph(){
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     source = audioCtx.createMediaElementSource(audio);
     source.connect(audioCtx.destination);
+    // iOS suspends this out from under playback for reasons that never
+    // reach JS as an event on the <audio> element itself (screen lock,
+    // a CarPlay/Bluetooth route change, a phone call) — this is the
+    // earliest possible hook to notice and claw it back, rather than
+    // waiting on the next visibility change or track boundary.
+    audioCtx.addEventListener('statechange', () => {
+      if(audioCtx.state === 'suspended') resumeAudioAndRetry();
+    });
   }catch(e){
     console.warn('[jam] Web Audio unavailable — falling back to plain <audio> output:', e);
     audioCtx = null;
