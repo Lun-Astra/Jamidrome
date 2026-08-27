@@ -294,6 +294,25 @@ YT_GENRE_KEYWORDS = {
     "latin", "soundtrack",
 }
 
+# yt-dlp's --add-metadata embeds the source video's own YouTube *category*
+# ("Music", "People & Blogs", "Gaming"...) straight into the GENRE tag —
+# a much coarser classification than a music genre (every music video is
+# generically "Music"), and not something lookup_genre()/YT_GENRE_KEYWORDS
+# above ever produces itself — it's already sitting in the file before any
+# of this app's own genre logic runs. fix_tags() clears it on sight rather
+# than leaving it in place whenever a real genre can't be found to replace
+# it with (see the same fix in Spotidrome, made after exactly this ended
+# up as a real track's permanent "genre").
+YT_VIDEO_CATEGORIES = {
+    "film & animation", "autos & vehicles", "music", "pets & animals",
+    "sports", "short movies", "travel & events", "gaming", "videoblogging",
+    "people & blogs", "comedy", "entertainment", "news & politics",
+    "howto & style", "education", "science & technology",
+    "nonprofits & activism", "movies", "anime/animation", "action/adventure",
+    "classics", "documentary", "drama", "family", "foreign", "horror",
+    "sci-fi/fantasy", "thriller", "shorts", "shows", "trailers",
+}
+
 def lookup_genre_from_youtube(artist):
     key = primary_artist(artist).strip()
     if not key:
@@ -367,6 +386,12 @@ def fix_tags(filepath, title, artist, album, album_artist=None, source_url=None,
             tags["comment"] = [source_url]
         if genre:
             tags["genre"] = [genre]
+        elif (tags.get("genre") or [""])[0].strip().lower() in YT_VIDEO_CATEGORIES:
+            # No real genre to set, but what's already there is a raw
+            # YouTube video category yt-dlp auto-embedded, not a music
+            # genre at all — clear it rather than keep it just because
+            # nothing better was found.
+            del tags["genre"]
         tags.save()
     except Exception as e:
         print(f"[jam] Tag fix failed for {filepath}: {e}", file=sys.stderr)
