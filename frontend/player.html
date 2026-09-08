@@ -780,8 +780,9 @@ function computeBarBins(){
   return bins;
 }
 
-// A peak-hold line (rises instantly, falls slowly under "gravity") and a
-// fading reflection below the baseline are the two signature touches kept
+// A peak-hold line (rises eased alongside the main curve, falls slowly
+// under "gravity" once it's ahead of it) and a fading reflection below the
+// baseline are the two signature touches kept
 // from the classic hi-fi/audioMotion-style spectrum analyzer look — just
 // traced as one continuous curve now instead of per-band bars/caps, per
 // Luna's call: a solid line reads as a waveform, not a bar chart.
@@ -851,13 +852,17 @@ function drawVisualizer(){
   // tripled the same frame-to-frame jitter into much bigger, faster-looking
   // pixel jumps, reading as "fast and spacy" instead of a flowing wave.
   // VIZ_SMOOTHING low-passes it: each frame only moves this fraction of the
-  // way toward the new target height, independent of the peaks[] gravity
-  // hold above (which still tracks the raw, un-smoothed heights so the
-  // hold marks stay honest about the actual momentary peak).
+  // way toward the new target height.
   const VIZ_SMOOTHING = 0.03;
   for(let j = 0; j < count; j++){
     smoothHeights[j] += (heights[j] - smoothHeights[j]) * VIZ_SMOOTHING;
-    peaks[j] = Math.max(heights[j], peaks[j] - baseline * 0.02); // gravity
+    // The peak-hold line used to chase raw heights[] on the rise (instant
+    // snap up on every transient, only the fall was eased under gravity) —
+    // Luna confirmed after the main curve got smoothed that this snap was
+    // the actual thing still reading as fast. Chasing smoothHeights instead
+    // means it rises at the same eased rate as the curve it's holding above,
+    // and only the gravity-fall stays instant-by-comparison/slow as before.
+    peaks[j] = Math.max(smoothHeights[j], peaks[j] - baseline * 0.02); // gravity
   }
 
   // Each band's sample sits at its center, not its left edge — otherwise a
