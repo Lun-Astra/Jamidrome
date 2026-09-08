@@ -831,7 +831,7 @@ function drawVisualizer(){
   // gain here (clamped to 1 so it still tops out exactly at the baseline
   // instead of clipping past it) makes typical peaks read taller overall,
   // regardless of volume.
-  const VIZ_GAIN = 1.6;
+  const VIZ_GAIN = 2.5;
 
   const heights = new Float32Array(count);
   for(let j = 0; j < count; j++){
