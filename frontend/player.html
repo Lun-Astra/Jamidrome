@@ -854,7 +854,7 @@ function drawVisualizer(){
   // way toward the new target height, independent of the peaks[] gravity
   // hold above (which still tracks the raw, un-smoothed heights so the
   // hold marks stay honest about the actual momentary peak).
-  const VIZ_SMOOTHING = 0.3;
+  const VIZ_SMOOTHING = 0.12;
   for(let j = 0; j < count; j++){
     smoothHeights[j] += (heights[j] - smoothHeights[j]) * VIZ_SMOOTHING;
     peaks[j] = Math.max(heights[j], peaks[j] - baseline * 0.02); // gravity
