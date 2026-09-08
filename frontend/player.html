@@ -780,11 +780,11 @@ function computeBarBins(){
   return bins;
 }
 
-// Peak-hold caps (rise instantly, fall slowly under "gravity") and a
-// fading reflection below the baseline are the two most recognizable
-// signature touches of the classic hi-fi/audioMotion-style spectrum
-// analyzer look (the same style Feishin's own visualizer is built on) —
-// a plain bar sweep reads as a generic bar chart without them.
+// A peak-hold line (rises instantly, falls slowly under "gravity") and a
+// fading reflection below the baseline are the two signature touches kept
+// from the classic hi-fi/audioMotion-style spectrum analyzer look — just
+// traced as one continuous curve now instead of per-band bars/caps, per
+// Luna's call: a solid line reads as a waveform, not a bar chart.
 let peaks = null;
 
 function drawVisualizer(){
@@ -799,10 +799,9 @@ function drawVisualizer(){
   if(!barBins) barBins = computeBarBins();
   const count = barBins.length;
   if(!peaks || peaks.length !== count) peaks = new Float32Array(count);
-  const barWidth = w / count;
-  const bw = Math.max(1, barWidth - 1);
-  const baseline = h * 0.62;   // bars occupy the top ~62%...
-  const reflH = h - baseline;  // ...and fade into a reflection below
+  const bandWidth = w / count;
+  const baseline = h * 0.62;   // the line occupies the top ~62%...
+  const reflH = h - baseline;  // ...and fades into a reflection below
   // getByteFrequencyData's minDecibels/maxDecibels span is wide (needs to
   // be, to give quiet vs. loud PARTS OF A TRACK a real visual difference
   // at a fixed volume) — 80dB of range means a volume-slider change alone
@@ -813,35 +812,74 @@ function drawVisualizer(){
   // within whatever a single volume setting's own dynamics look like.
   const volScale = audio.muted ? 0 : audio.volume;
 
+  const heights = new Float32Array(count);
   for(let j = 0; j < count; j++){
     const [from, to] = barBins[j];
     let peak = 0;
     for(let i = from; i < to; i++) if(freqData[i] > peak) peak = freqData[i];
-    const barHeight = (peak / 255) * baseline * volScale;
-    peaks[j] = Math.max(barHeight, peaks[j] - baseline * 0.02); // gravity
-
-    const x = j * barWidth;
-    const grad = ctx.createLinearGradient(0, baseline - barHeight, 0, baseline);
-    grad.addColorStop(0, '#1ed760');
-    grad.addColorStop(1, '#8b5cf6');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    if(ctx.roundRect) ctx.roundRect(x, baseline - barHeight, bw, barHeight, [2, 2, 0, 0]);
-    else ctx.rect(x, baseline - barHeight, bw, barHeight);
-    ctx.fill();
-
-    // Peak-hold cap
-    ctx.fillStyle = 'rgba(255,255,255,.85)';
-    ctx.fillRect(x, baseline - peaks[j] - 2, bw, 2);
-
-    // Reflection: same bar mirrored below the baseline, fading out
-    const rh = Math.min(barHeight, reflH);
-    const rGrad = ctx.createLinearGradient(0, baseline, 0, baseline + rh);
-    rGrad.addColorStop(0, 'rgba(30,215,96,.28)');
-    rGrad.addColorStop(1, 'rgba(139,92,246,0)');
-    ctx.fillStyle = rGrad;
-    ctx.fillRect(x, baseline, bw, rh);
+    heights[j] = (peak / 255) * baseline * volScale;
+    peaks[j] = Math.max(heights[j], peaks[j] - baseline * 0.02); // gravity
   }
+
+  // Each band's sample sits at its center, not its left edge — otherwise a
+  // 48-point line reads as a staircase pinned to the left of each band
+  // instead of one wave running through the middle of them.
+  const px = j => (j + 0.5) * bandWidth;
+  // Traces one smooth curve through every band's y for a given height
+  // array, using a quadratic curve to the midpoint between each pair of
+  // points (the standard trick for turning N discrete samples into a
+  // continuous-looking line instead of a jagged connect-the-dots).
+  const traceLine = ys => {
+    ctx.moveTo(px(0), baseline - ys[0]);
+    for(let j = 0; j < count - 1; j++){
+      const xc = (px(j) + px(j + 1)) / 2, yc = baseline - (ys[j] + ys[j + 1]) / 2;
+      ctx.quadraticCurveTo(px(j), baseline - ys[j], xc, yc);
+    }
+    ctx.lineTo(px(count - 1), baseline - ys[count - 1]);
+  };
+
+  const grad = ctx.createLinearGradient(0, 0, 0, baseline);
+  grad.addColorStop(0, '#1ed760');
+  grad.addColorStop(1, '#8b5cf6');
+
+  // Filled area under the curve, then the curve itself stroked crisp on top.
+  ctx.beginPath();
+  traceLine(heights);
+  ctx.lineTo(w, baseline);
+  ctx.lineTo(0, baseline);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.globalAlpha = .35;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  ctx.beginPath();
+  traceLine(heights);
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  // Peak-hold line
+  ctx.beginPath();
+  traceLine(peaks);
+  ctx.strokeStyle = 'rgba(255,255,255,.85)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Reflection: the same curve mirrored below the baseline, fading out
+  const reflected = new Float32Array(count);
+  for(let j = 0; j < count; j++) reflected[j] = -Math.min(heights[j], reflH);
+  ctx.beginPath();
+  traceLine(reflected);
+  ctx.lineTo(w, baseline);
+  ctx.lineTo(0, baseline);
+  ctx.closePath();
+  const rGrad = ctx.createLinearGradient(0, baseline, 0, baseline + reflH);
+  rGrad.addColorStop(0, 'rgba(30,215,96,.28)');
+  rGrad.addColorStop(1, 'rgba(139,92,246,0)');
+  ctx.fillStyle = rGrad;
+  ctx.fill();
 }
 </script>
 </body>
