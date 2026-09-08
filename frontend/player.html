@@ -786,6 +786,7 @@ function computeBarBins(){
 // traced as one continuous curve now instead of per-band bars/caps, per
 // Luna's call: a solid line reads as a waveform, not a bar chart.
 let peaks = null;
+let smoothHeights = null; // low-passed version of heights[] the curve is actually drawn from
 
 function drawVisualizer(){
   requestAnimationFrame(drawVisualizer);
@@ -830,8 +831,12 @@ function drawVisualizer(){
   // was generally sitting well short of the room it actually has — a flat
   // gain here (clamped to 1 so it still tops out exactly at the baseline
   // instead of clipping past it) makes typical peaks read taller overall,
-  // regardless of volume.
-  const VIZ_GAIN = 2.5;
+  // regardless of volume. Pulled back from 2.5 to 1.8 alongside adding
+  // smoothing below — at 2.5, more of the range was hitting that clamp,
+  // which is exactly what made it flicker flat-out and drop rather than
+  // swing smoothly.
+  const VIZ_GAIN = 1.8;
+  if(!smoothHeights || smoothHeights.length !== count) smoothHeights = new Float32Array(count);
 
   const heights = new Float32Array(count);
   for(let j = 0; j < count; j++){
@@ -839,6 +844,19 @@ function drawVisualizer(){
     let peak = 0;
     for(let i = from; i < to; i++) if(freqData[i] > peak) peak = freqData[i];
     heights[j] = Math.min(1, (peak / 255) * VIZ_GAIN) * baseline * volScale;
+  }
+  // The curve used to redraw from raw heights[] every single animation
+  // frame (~60/sec) with zero smoothing of its own — fine at the old 90px
+  // canvas size, but tripling the canvas to 270px (see the earlier commit)
+  // tripled the same frame-to-frame jitter into much bigger, faster-looking
+  // pixel jumps, reading as "fast and spacy" instead of a flowing wave.
+  // VIZ_SMOOTHING low-passes it: each frame only moves this fraction of the
+  // way toward the new target height, independent of the peaks[] gravity
+  // hold above (which still tracks the raw, un-smoothed heights so the
+  // hold marks stay honest about the actual momentary peak).
+  const VIZ_SMOOTHING = 0.3;
+  for(let j = 0; j < count; j++){
+    smoothHeights[j] += (heights[j] - smoothHeights[j]) * VIZ_SMOOTHING;
     peaks[j] = Math.max(heights[j], peaks[j] - baseline * 0.02); // gravity
   }
 
@@ -865,7 +883,7 @@ function drawVisualizer(){
 
   // Filled area under the curve, then the curve itself stroked crisp on top.
   ctx.beginPath();
-  traceLine(heights);
+  traceLine(smoothHeights);
   ctx.lineTo(w, baseline);
   ctx.lineTo(0, baseline);
   ctx.closePath();
@@ -875,7 +893,7 @@ function drawVisualizer(){
   ctx.globalAlpha = 1;
 
   ctx.beginPath();
-  traceLine(heights);
+  traceLine(smoothHeights);
   ctx.strokeStyle = grad;
   ctx.lineWidth = 2;
   ctx.lineJoin = 'round';
@@ -890,7 +908,7 @@ function drawVisualizer(){
 
   // Reflection: the same curve mirrored below the baseline, fading out
   const reflected = new Float32Array(count);
-  for(let j = 0; j < count; j++) reflected[j] = -Math.min(heights[j], reflH);
+  for(let j = 0; j < count; j++) reflected[j] = -Math.min(smoothHeights[j], reflH);
   ctx.beginPath();
   traceLine(reflected);
   ctx.lineTo(w, baseline);
