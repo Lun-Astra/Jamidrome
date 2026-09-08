@@ -813,12 +813,17 @@ function drawVisualizer(){
   // A plain linear scale (volScale = audio.volume) overcorrects, though:
   // turned down to 10% it crushes the line to a barely-visible sliver.
   // Raising it to a fractional power front-loads movement at the low end
-  // (10% volume -> ~40% of full-scale motion, per Luna's call) while
-  // still hitting exactly 0 at mute/zero and exactly 1 (unchanged) at full
-  // volume — perceptual loudness works the same way (roughly logarithmic,
-  // not linear), so this reads as more "alive" at low volume rather than
-  // as inaccurate.
-  const VIZ_VOLUME_GAMMA = 0.4;
+  // while still hitting exactly 0 at mute/zero and exactly 1 (unchanged) at
+  // full volume — perceptual loudness works the same way (roughly
+  // logarithmic, not linear), so this reads as more "alive" at low volume
+  // rather than as inaccurate. This scales both directions the line moves
+  // at once (heights[] feeds both the upward curve and, mirrored, the
+  // downward reflection), so a lower gamma means bigger swings both above
+  // and below the baseline at quiet volumes, not just a taller ceiling.
+  // 0.4 (10% volume -> ~40% of full-scale motion) still read as too flat
+  // per Luna's follow-up, so dropped further to 0.25 (10% volume -> ~56%,
+  // 50% volume -> ~84%).
+  const VIZ_VOLUME_GAMMA = 0.25;
   const volScale = audio.muted ? 0 : Math.pow(audio.volume, VIZ_VOLUME_GAMMA);
 
   const heights = new Float32Array(count);
