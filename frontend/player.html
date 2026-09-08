@@ -853,7 +853,7 @@ function drawVisualizer(){
   // pixel jumps, reading as "fast and spacy" instead of a flowing wave.
   // VIZ_SMOOTHING low-passes it: each frame only moves this fraction of the
   // way toward the new target height.
-  const VIZ_SMOOTHING = 0.03;
+  const VIZ_SMOOTHING = 0.15;
   for(let j = 0; j < count; j++){
     smoothHeights[j] += (heights[j] - smoothHeights[j]) * VIZ_SMOOTHING;
     // The peak-hold line used to chase raw heights[] on the rise (instant
