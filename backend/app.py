@@ -69,6 +69,19 @@ REQUEST_PAGE_URL     = os.environ.get("REQUEST_PAGE_URL", "").rstrip("/")
 MIN_INVITE_TTL_SEC   = 60
 MAX_INVITE_TTL_SEC   = 7 * 24 * 3600
 
+# This app has no accounts of any kind otherwise — a single shared PIN, set
+# once via .env and known only to whoever's actually running the jam, is the
+# entire moderation boundary for the /host/* routes below. Deliberately not
+# more than that: real accounts would be pure overhead for a living-room
+# party app that already treats "has the QR link" as "trusted enough to
+# request/vote."
+JAM_HOST_PIN = os.environ.get("JAM_HOST_PIN", "")
+
+REACTION_EMOJIS      = {"🔥", "❤️", "😂", "👏", "🎉", "💃"}
+REACTION_COOLDOWN_SEC = 1.5   # per session — keeps one person from flooding
+                              # the shared screen with a single held-down tap
+MAX_REACTIONS_KEPT   = 60
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ─── State ───────────────────────────────────────────────────────────────────
@@ -79,9 +92,21 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 #          from the player page; each one is independent (generating a new
 #          one does not invalidate earlier ones) and reusable by anyone who
 #          has it until it expires.
+# banned_sessions: session_ids the host has kicked — checked wherever a
+#          session_id could otherwise request/upvote/skip-vote; doesn't
+#          revoke anything already queued, just blocks new interactions.
 state_lock = threading.Lock()
 state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None, "invites": {},
-         "paused": False, "pause_started_at": None, "autoplay_enabled": True}
+         "paused": False, "pause_started_at": None, "autoplay_enabled": True, "banned_sessions": []}
+
+# Live emoji reactions fired from the request page and animated over the
+# player page — deliberately kept out of `state`/state.json entirely rather
+# than persisted: they're meant to feel like a live crowd reaction, not
+# something that should survive a backend restart or show up in history.
+reactions_lock = threading.Lock()
+reactions = []           # rolling list of {seq, emoji, ts}, newest last
+_reaction_seq = 0
+_last_reaction_at = {}   # session_id -> unix time of their last accepted reaction
 
 
 def load_state():
@@ -118,6 +143,23 @@ def find_item(item_id):
         if item["id"] == item_id:
             return item
     return None
+
+
+def _require_host_pin():
+    """Gate for every /host/* route. Returns a Flask response to abort the
+    request with, or None to let it proceed. Unconfigured (no JAM_HOST_PIN
+    set) fails closed rather than falling back to "no check" — better to
+    make Luna go set it than to silently ship moderation routes nobody
+    can actually reach but that also aren't protected."""
+    if not JAM_HOST_PIN:
+        return jsonify({"error": "Host controls aren't configured — set JAM_HOST_PIN in .env"}), 503
+    if request.headers.get("X-Jam-Host-Pin", "") != JAM_HOST_PIN:
+        return jsonify({"error": "Wrong PIN"}), 403
+    return None
+
+
+def _is_banned(session_id):
+    return bool(session_id) and session_id in (state.get("banned_sessions") or [])
 
 
 def public_view(item, include_stream=False, session_id=None):
@@ -904,6 +946,26 @@ def download_track(item):
         # partial audio file, thumbnail, etc. even on a failed run
         raise RuntimeError((r.stderr or "yt-dlp failed")[-300:])
 
+    # Unlike Spotidrome's own algorithmic best-match search, a jam request
+    # comes from a human picking an exact search result they could already
+    # see the title/artist/thumbnail of — so the classic "matched a
+    # completely different song" failure Spotidrome had to guard against
+    # (see spotidrome-wrong-track-bugs notes) barely applies here. Still
+    # worth a cheap sanity check: yt-dlp resolving that exact video_id to
+    # something wildly longer or shorter than what search reported (a stale/
+    # redirected id, a since-edited upload, an actual yt-dlp mismatch) is
+    # rare but not impossible, and would otherwise silently become the new
+    # "official" duration with nothing to flag it. Checked before fix_tags/
+    # maybe_correct_album do any tagging or moving, so a rejected file never
+    # gets either.
+    duration = ffprobe_duration(out_path)
+    expected_duration = item.get("duration")
+    if expected_duration and duration and not _duration_close_enough(duration, expected_duration):
+        _cleanup_downloaded_files(item["id"])
+        raise RuntimeError(
+            f"downloaded audio is {duration/60:.1f} min but the search result said "
+            f"~{expected_duration/60:.1f} min — likely the wrong video")
+
     # If the pick came from the YT Music 'songs' search tier, its own real
     # album name is already known and authoritative — start from that
     # instead of empty, so maybe_correct_album's placeholder check sees a
@@ -916,7 +978,7 @@ def download_track(item):
         out_path, item["title"], item["artist"], known_album, "Jam", item["url"], DOWNLOAD_DIR,
         album_artist=item["artist"])
 
-    return out_path, ffprobe_duration(out_path), album, genre
+    return out_path, duration, album, genre
 
 
 def _cleanup_downloaded_files(item_id):
@@ -1142,19 +1204,45 @@ def download_worker_loop():
         try:
             local_path, duration, album, genre = download_track(item)
             with state_lock:
-                item["local_path"] = local_path
-                item["duration"] = duration or item.get("duration")
-                item["album"] = album
-                item["genre"] = genre
-                item["status"] = "ready"
-                _promote_next_if_idle()
-                save_state()
-            threading.Thread(target=sync_to_navidrome_bg, args=(item,), daemon=True).start()
+                # The host can delete a queue item mid-download (see
+                # route_host_delete) — it can't be safely ripped out of the
+                # list while this same dict is being mutated out from under
+                # it, so a delete on an in-flight download just flags it
+                # instead. Discovering that flag here means: don't promote
+                # it, don't sync it to Navidrome, just discard the file and
+                # drop it from the queue entirely (no history entry either —
+                # the host removed it, it never really "played").
+                if item.get("removed"):
+                    if item in state["queue"]:
+                        state["queue"].remove(item)
+                    save_state()
+                    should_sync = False
+                else:
+                    item["local_path"] = local_path
+                    item["duration"] = duration or item.get("duration")
+                    item["album"] = album
+                    item["genre"] = genre
+                    item["status"] = "ready"
+                    _promote_next_if_idle()
+                    save_state()
+                    should_sync = True
+            if should_sync:
+                threading.Thread(target=sync_to_navidrome_bg, args=(item,), daemon=True).start()
+            else:
+                try:
+                    if local_path and os.path.exists(local_path):
+                        os.remove(local_path)
+                except Exception:
+                    pass
         except Exception as e:
             with state_lock:
-                item["status"] = "failed"
-                item["error"] = str(e)[:300]
-                _promote_next_if_idle()  # a failed item must not block everything queued behind it
+                if item.get("removed"):
+                    if item in state["queue"]:
+                        state["queue"].remove(item)
+                else:
+                    item["status"] = "failed"
+                    item["error"] = str(e)[:300]
+                    _promote_next_if_idle()  # a failed item must not block everything queued behind it
                 save_state()
             print(f"[jam] Download failed for {item.get('title')}: {e}", flush=True)
 
@@ -1245,6 +1333,12 @@ def _enqueue_track(video_id, url, title, artist, duration=None, thumbnail="",
     title = (title or "Unknown title").strip()
     artist = (artist or "Unknown artist").strip()
 
+    # session_id is None for the Auto DJ/similar-songs autofill call below,
+    # which _is_banned already treats as "not banned" — a ban only ever
+    # blocks a real human session, never the server's own autofill.
+    if _is_banned(session_id):
+        return None, ("You've been removed from this jam by the host", 403)
+
     # Checked outside state_lock — it's a Navidrome network call, not
     # shared in-memory state, and shouldn't hold up every other request
     # while it's in flight.
@@ -1317,6 +1411,8 @@ def route_queue_upvote(item_id):
     added_at stays a meaningful tiebreak and nothing else has to change to
     respect the new order."""
     session_id = request.headers.get("X-Jam-Session", "") or request.remote_addr or ""
+    if _is_banned(session_id):
+        return jsonify({"error": "You've been removed from this jam by the host"}), 403
     with state_lock:
         item = find_item(item_id)
         if not item or item["status"] == "playing":
@@ -1341,6 +1437,8 @@ def route_vote_skip(item_id):
     presence tracking here to know how many people are actually in the
     jam right now to compute one against."""
     session_id = request.headers.get("X-Jam-Session", "") or request.remote_addr or ""
+    if _is_banned(session_id):
+        return jsonify({"error": "You've been removed from this jam by the host"}), 403
     with state_lock:
         if state["now_playing_id"] != item_id:
             return jsonify({"error": "That track isn't currently playing"}), 400
@@ -1572,6 +1670,133 @@ def route_invite_consume(token):
         text-align:center;padding:24px}</style></head>
         <body><div><h2>This invite link has expired</h2>
         <p style="color:#9090b0">Ask whoever's hosting for a fresh one.</p></div></body></html>""", 404)
+
+
+# ─── Host controls ───────────────────────────────────────────────────────────
+# The only moderation surface in the app — see _require_host_pin above for
+# why a single shared PIN is the whole auth model here. Meant to be reached
+# from a hidden panel on the player page only (never surfaced on the public
+# request page), since whoever's standing at the actual display is who
+# should hold the PIN.
+
+@app.route("/host/queue")
+def route_host_queue():
+    err = _require_host_pin()
+    if err:
+        return err
+    with state_lock:
+        now_playing = find_item(state["now_playing_id"]) if state["now_playing_id"] else None
+        upcoming = sorted((i for i in state["queue"] if i["status"] != "playing"), key=_queue_sort_key)
+
+        def host_view(item):
+            # public_view strips session_id (guests have no business seeing
+            # who requested what) — the host panel needs it specifically to
+            # offer "ban this person" next to each track.
+            v = public_view(item)
+            v["session_id"] = item.get("session_id")
+            return v
+
+        return jsonify({
+            "now_playing": host_view(now_playing) if now_playing else None,
+            "queue": [host_view(i) for i in upcoming],
+            "banned_sessions": state.get("banned_sessions") or [],
+        })
+
+
+@app.route("/host/queue/<item_id>/delete", methods=["POST"])
+def route_host_delete(item_id):
+    """Unconditional delete, regardless of status — unlike the public
+    /queue/<id>/remove (queued only, no ownership check either, but that's
+    a separate pre-existing gap). Removes a queued/ready item outright;
+    flags a downloading one for the worker loop to discard once it finishes
+    instead of promoting/syncing it (see download_worker_loop); skips the
+    currently-playing item to whatever's next, same as a passed skip vote."""
+    err = _require_host_pin()
+    if err:
+        return err
+    do_advance = False
+    with state_lock:
+        item = find_item(item_id)
+        if not item:
+            return jsonify({"error": "Not found"}), 404
+        if item["status"] == "playing":
+            do_advance = True
+        elif item["status"] == "downloading":
+            item["removed"] = True
+        else:
+            state["queue"].remove(item)
+        save_state()
+    if do_advance:
+        advance(expected_id=item_id)  # outside state_lock — advance() takes its own
+    return jsonify({"ok": True})
+
+
+@app.route("/host/ban", methods=["POST"])
+def route_host_ban():
+    err = _require_host_pin()
+    if err:
+        return err
+    session_id = ((request.json or {}).get("session_id") or "").strip()
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+    with state_lock:
+        banned = state.setdefault("banned_sessions", [])
+        if session_id not in banned:
+            banned.append(session_id)
+        save_state()
+        return jsonify({"ok": True, "banned_sessions": banned})
+
+
+@app.route("/host/unban", methods=["POST"])
+def route_host_unban():
+    err = _require_host_pin()
+    if err:
+        return err
+    session_id = ((request.json or {}).get("session_id") or "").strip()
+    with state_lock:
+        banned = state.setdefault("banned_sessions", [])
+        if session_id in banned:
+            banned.remove(session_id)
+        save_state()
+        return jsonify({"ok": True, "banned_sessions": banned})
+
+
+# ─── Live reactions ──────────────────────────────────────────────────────────
+# Fired from the request page's fixed emoji row, polled and animated as
+# floating emoji on the player page — see the `reactions` global above for
+# why these are kept in-memory only, never in `state`.
+
+@app.route("/reactions/send", methods=["POST"])
+def route_reaction_send():
+    global _reaction_seq
+    emoji = ((request.json or {}).get("emoji") or "").strip()
+    if emoji not in REACTION_EMOJIS:
+        return jsonify({"error": "Unknown reaction"}), 400
+    session_id = request.headers.get("X-Jam-Session", "") or request.remote_addr or ""
+    if _is_banned(session_id):
+        return jsonify({"error": "You've been removed from this jam by the host"}), 403
+    now = time.time()
+    with reactions_lock:
+        if now - _last_reaction_at.get(session_id, 0) < REACTION_COOLDOWN_SEC:
+            return jsonify({"error": "Slow down"}), 429
+        _last_reaction_at[session_id] = now
+        _reaction_seq += 1
+        reactions.append({"seq": _reaction_seq, "emoji": emoji, "ts": now})
+        del reactions[:-MAX_REACTIONS_KEPT]
+    return jsonify({"ok": True})
+
+
+@app.route("/reactions/poll")
+def route_reactions_poll():
+    """Cursor-based, not time-based — the player page remembers the highest
+    `seq` it's already shown and asks for anything newer, so a slow poll
+    tick or a brief disconnect can't replay the same reaction twice or miss
+    one, the way a fixed time window could."""
+    after = int(request.args.get("after", 0) or 0)
+    with reactions_lock:
+        new = [r for r in reactions if r["seq"] > after]
+        latest = _reaction_seq
+    return jsonify({"reactions": new, "latest": latest})
 
 
 load_state()

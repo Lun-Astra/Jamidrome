@@ -80,6 +80,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .skip-vote-btn:hover{color:var(--text)}
 .skip-vote-btn.on{background:rgba(248,113,113,.14);border-color:rgba(248,113,113,.35);color:#f87171}
 
+.reactions-row{display:flex;gap:8px;justify-content:center;margin-bottom:18px}
+.reaction-btn{background:var(--bg2);border:1px solid var(--border);border-radius:50%;width:42px;height:42px;
+  font-size:19px;cursor:pointer;transition:transform .1s,opacity .1s;display:flex;align-items:center;justify-content:center}
+.reaction-btn:active{transform:scale(1.15)}
+.reaction-btn:disabled{opacity:.4;cursor:default}
+
 .empty{padding:24px;text-align:center;color:var(--text3);font-size:12.5px}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--bg4);border:1px solid var(--border2);border-radius:20px;padding:10px 18px;font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;pointer-events:none;z-index:50}
 .toast.show{opacity:1}
@@ -97,6 +103,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
   <div class="now-playing" id="now-playing">
     <div class="np-empty">Nothing playing yet — be the first to add a song.</div>
   </div>
+
+  <div class="reactions-row" id="reactions-row"></div>
 
   <div class="search-row">
     <input id="search-input" placeholder="Search for a song…" autocomplete="off">
@@ -128,6 +136,26 @@ if(!SESSION_ID){
   localStorage.setItem('jam_session_id', SESSION_ID);
 }
 const SESSION_HEADERS = {'X-Jam-Session': SESSION_ID};
+
+// Fixed set, mirrors REACTION_EMOJIS in backend/app.py — the server is the
+// actual source of truth (it rejects anything else with a 400) and doesn't
+// serve this list itself, so it just has to be kept in sync by hand if it
+// ever changes there.
+const REACTION_EMOJIS = ['🔥','❤️','😂','👏','🎉','💃'];
+document.getElementById('reactions-row').innerHTML = REACTION_EMOJIS.map(e =>
+  `<button class="reaction-btn" onclick="sendReaction('${e}', this)">${e}</button>`).join('');
+
+async function sendReaction(emoji, btn){
+  // Soft client-side cooldown purely for UX (disables the exact button just
+  // tapped so a double-tap doesn't look broken) — REACTION_COOLDOWN_SEC on
+  // the server is the real enforcement, this isn't relied on for it.
+  btn.disabled = true;
+  setTimeout(() => { btn.disabled = false; }, 1500);
+  try{
+    await fetch(`${API}/reactions/send`, {method:'POST', headers:{'Content-Type':'application/json', ...SESSION_HEADERS},
+      body: JSON.stringify({emoji})});
+  }catch(e){}
+}
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function fmtDur(s){if(!s)return'';s=Math.round(s);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;}

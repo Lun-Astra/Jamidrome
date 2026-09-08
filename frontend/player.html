@@ -70,10 +70,23 @@ body::before{content:'';position:fixed;inset:0;
 .vol-ctrl input[type=range]{width:90px;accent-color:var(--sp);cursor:pointer}
 #invite-btn{position:fixed;top:60px;left:28px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;z-index:5}
 #invite-btn:hover{color:var(--text)}
+#host-btn{position:fixed;top:104px;left:28px;background:var(--bg3);border:1px solid var(--border);color:var(--text2);border-radius:20px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;z-index:5}
+#host-btn:hover{color:var(--text)}
 
 #audio-unlock{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);display:none;
   background:var(--sp);color:#06210f;border:none;border-radius:24px;padding:12px 24px;
   font-size:14px;font-weight:700;cursor:pointer;z-index:15;box-shadow:0 10px 30px rgba(0,0,0,.4)}
+
+/* Reactions fired from the request page — see pollReactions()/spawnReaction()
+   below. Fixed + a z-index above the stage but below the modals, so they
+   drift up over the visualizer without ever blocking a click on anything. */
+.reaction-float{position:fixed;bottom:18%;font-size:38px;pointer-events:none;z-index:8;
+  animation:reaction-rise 2.6s ease-out forwards}
+@keyframes reaction-rise{
+  0%{opacity:0;transform:translateY(0) scale(.5)}
+  15%{opacity:1;transform:translateY(-10vh) scale(1)}
+  100%{opacity:0;transform:translateY(-52vh) scale(1.1)}
+}
 
 /* .top-right's four controls (volume, pause, skip, Auto DJ) add up to
    roughly 450px of un-wrapping fixed-position content — nowhere close
@@ -93,6 +106,8 @@ body::before{content:'';position:fixed;inset:0;
   .vol-ctrl input[type=range]{width:64px}
   #skip-btn,#pause-btn,#autodj-btn{padding:6px 12px;font-size:11px}
   #invite-btn{top:max(58px,calc(env(safe-area-inset-top) + 48px));left:max(16px,env(safe-area-inset-left));
+    padding:6px 12px;font-size:11px}
+  #host-btn{top:max(94px,calc(env(safe-area-inset-top) + 84px));left:max(16px,env(safe-area-inset-left));
     padding:6px 12px;font-size:11px}
   .stage{padding:96px 20px 120px}
   .art-wrap{width:min(34vh,220px);height:min(34vh,220px);margin-bottom:20px}
@@ -126,6 +141,30 @@ body::before{content:'';position:fixed;inset:0;
 .im-item button.im-revoke:hover{color:#f87171}
 .im-item button.im-reopen:hover{color:var(--sp)}
 .im-empty{color:var(--text3);font-size:12px;padding:6px 2px}
+
+/* Host panel — same modal chrome as the invite one (#invite-modal/.im-*
+   above), own class prefix since the contents are unrelated. */
+#host-modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:20;display:none;align-items:center;justify-content:center}
+#host-modal.show{display:flex}
+.hm-card{background:var(--bg2);border:1px solid var(--border2);border-radius:16px;padding:22px 24px;width:min(90vw,460px);text-align:left;max-height:85vh;overflow-y:auto}
+.hm-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.hm-hd h3{font-family:var(--font2);font-size:17px}
+.hm-close{background:none;border:none;color:var(--text3);font-size:18px;cursor:pointer}
+.hm-sec-title{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;font-weight:500;margin:14px 0 8px}
+.hm-list{display:flex;flex-direction:column;gap:6px}
+.hm-item{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px}
+.hm-item img{width:32px;height:32px;border-radius:6px;object-fit:cover;flex-shrink:0;background:var(--bg4)}
+.hm-item .info{flex:1;min-width:0}
+.hm-item .t{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hm-item .s{color:var(--text3);font-size:10.5px;margin-top:1px}
+.hm-item button{background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;flex-shrink:0}
+.hm-item button.hm-delete:hover{color:#f87171}
+.hm-item button.hm-ban:hover{color:#f59e0b}
+.hm-item button.hm-unban:hover{color:var(--sp)}
+.hm-empty{color:var(--text3);font-size:12px;padding:6px 2px}
+.hm-pin-gate{text-align:center;padding:20px 0}
+.hm-pin-gate input{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 10px;color:var(--text);font-size:13px;outline:none;width:160px;text-align:center;margin:10px 0}
+.hm-pin-gate .err{color:#f87171;font-size:12px;min-height:16px}
 </style>
 </head>
 <body>
@@ -146,6 +185,7 @@ body::before{content:'';position:fixed;inset:0;
   <button id="autodj-btn" onclick="toggleAutoplay()" title="When on, picks and plays something similar once the queue runs dry">🔁 Auto DJ: On</button>
 </div>
 <button id="invite-btn" onclick="openInvite()">🔗 Invite</button>
+<button id="host-btn" onclick="openHost()">🛠 Host</button>
 <button id="audio-unlock" onclick="tryPlay()">🔇 Tap to enable sound</button>
 
 <div id="invite-modal">
@@ -171,6 +211,24 @@ body::before{content:'';position:fixed;inset:0;
     </div>
     <div class="im-sec-title">Active Links</div>
     <div class="im-list" id="im-list"><div class="im-empty">None yet</div></div>
+  </div>
+</div>
+
+<div id="host-modal">
+  <div class="hm-card">
+    <div class="hm-hd"><h3>Host Controls</h3><button class="hm-close" onclick="closeHost()">✕</button></div>
+    <div id="hm-pin-gate" class="hm-pin-gate">
+      <div>Enter the host PIN (set as <code>JAM_HOST_PIN</code> in <code>.env</code>)</div>
+      <input id="hm-pin-input" type="password" inputmode="numeric" placeholder="PIN" autocomplete="off">
+      <div class="err" id="hm-pin-err"></div>
+      <button class="btn" onclick="submitHostPin()">Unlock</button>
+    </div>
+    <div id="hm-body" style="display:none">
+      <div class="hm-sec-title">Queue</div>
+      <div class="hm-list" id="hm-queue-list"><div class="hm-empty">Loading…</div></div>
+      <div class="hm-sec-title">Banned</div>
+      <div class="hm-list" id="hm-banned-list"><div class="hm-empty">Nobody's banned</div></div>
+    </div>
   </div>
 </div>
 
@@ -689,6 +747,128 @@ async function revokeInvite(token){
   await fetch(`${API}/invite/${token}/revoke`, {method:'POST', headers: SESSION_HEADERS});
   refreshInviteList();
 }
+
+// ── Live reactions ────────────────────────────────────────────────────────
+// Cursor-based polling, own interval separate from the main /player/state
+// poll() — reactions are a different concern (transient, never affects
+// what's playing) and don't need to share its 1s cadence.
+let lastReactionSeq = 0;
+
+function spawnReaction(emoji){
+  const el = document.createElement('div');
+  el.className = 'reaction-float';
+  el.textContent = emoji;
+  // Random horizontal spot + a little random drift built into the each
+  // instance's own transform via a CSS var would be more work than it's
+  // worth here — a random left position and a random animation-delay
+  // stagger already reads as "a bunch of separate reactions", not a single
+  // one replayed.
+  el.style.left = `${10 + Math.random() * 80}vw`;
+  el.style.animationDelay = `${Math.random() * 0.3}s`;
+  document.body.appendChild(el);
+  el.addEventListener('animationend', () => el.remove());
+}
+
+async function pollReactions(){
+  try{
+    const r = await fetch(`${API}/reactions/poll?after=${lastReactionSeq}`);
+    const d = await r.json();
+    (d.reactions || []).forEach(rx => spawnReaction(rx.emoji));
+    if(typeof d.latest === 'number') lastReactionSeq = d.latest;
+  }catch(e){}
+  setTimeout(pollReactions, 1200);
+}
+pollReactions();
+
+// ── Host panel ────────────────────────────────────────────────────────────
+// The PIN is the entire auth model (see _require_host_pin in the backend) —
+// stored in localStorage once entered correctly so it isn't re-typed every
+// time, same trust level as SESSION_ID above (this browser, not this
+// person). A wrong/missing PIN just re-shows the gate with an error rather
+// than ever silently failing open.
+let hostPin = localStorage.getItem('jam_host_pin') || '';
+let hostPollTimer = null;
+
+function hostHeaders(){ return {'Content-Type':'application/json', 'X-Jam-Host-Pin': hostPin}; }
+
+function openHost(){
+  document.getElementById('host-modal').classList.add('show');
+  document.getElementById('hm-pin-err').textContent = '';
+  if(hostPin){ showHostBody(); } else { showHostGate(); }
+}
+function closeHost(){
+  document.getElementById('host-modal').classList.remove('show');
+  clearTimeout(hostPollTimer);
+}
+function showHostGate(){
+  document.getElementById('hm-pin-gate').style.display = 'block';
+  document.getElementById('hm-body').style.display = 'none';
+  document.getElementById('hm-pin-input').value = '';
+  document.getElementById('hm-pin-input').focus();
+}
+function showHostBody(){
+  document.getElementById('hm-pin-gate').style.display = 'none';
+  document.getElementById('hm-body').style.display = 'block';
+  refreshHostPanel();
+}
+function submitHostPin(){
+  hostPin = document.getElementById('hm-pin-input').value.trim();
+  localStorage.setItem('jam_host_pin', hostPin);
+  showHostBody();
+}
+document.getElementById('hm-pin-input').addEventListener('keydown', e => { if(e.key === 'Enter') submitHostPin(); });
+
+async function refreshHostPanel(){
+  clearTimeout(hostPollTimer);
+  try{
+    const r = await fetch(`${API}/host/queue`, {headers: hostHeaders()});
+    const d = await r.json();
+    if(!r.ok){
+      // Wrong/unconfigured PIN — drop the stored one and re-show the gate
+      // with the actual reason, rather than silently spinning forever.
+      localStorage.removeItem('jam_host_pin');
+      hostPin = '';
+      showHostGate();
+      document.getElementById('hm-pin-err').textContent = d.error || 'Could not load host controls';
+      return;
+    }
+    const items = [d.now_playing, ...(d.queue || [])].filter(Boolean);
+    const list = document.getElementById('hm-queue-list');
+    list.innerHTML = items.length ? items.map(it => `
+      <div class="hm-item">
+        <img src="${esc(it.thumbnail)}">
+        <div class="info">
+          <div class="t">${esc(it.title)}${it.status === 'playing' ? ' · ▶ playing' : ''}</div>
+          <div class="s">${esc(it.artist)} · requested by ${esc(it.requested_by)}</div>
+        </div>
+        ${it.session_id ? `<button class="hm-ban" title="Ban requester" onclick="hostBan('${escA(it.session_id)}')">🚫</button>` : ''}
+        <button class="hm-delete" title="Delete" onclick="hostDelete('${it.id}')">✕</button>
+      </div>`).join('') : '<div class="hm-empty">Queue is empty</div>';
+
+    const banned = d.banned_sessions || [];
+    const bl = document.getElementById('hm-banned-list');
+    bl.innerHTML = banned.length ? banned.map(sid => `
+      <div class="hm-item">
+        <div class="info"><div class="t">…${esc(sid.slice(-8))}</div></div>
+        <button class="hm-unban" title="Unban" onclick="hostUnban('${escA(sid)}')">↺</button>
+      </div>`).join('') : '<div class="hm-empty">Nobody\'s banned</div>';
+  }catch(e){}
+  hostPollTimer = setTimeout(refreshHostPanel, 3000);
+}
+
+async function hostDelete(itemId){
+  await fetch(`${API}/host/queue/${itemId}/delete`, {method:'POST', headers: hostHeaders()});
+  refreshHostPanel();
+}
+async function hostBan(sessionId){
+  await fetch(`${API}/host/ban`, {method:'POST', headers: hostHeaders(), body: JSON.stringify({session_id: sessionId})});
+  refreshHostPanel();
+}
+async function hostUnban(sessionId){
+  await fetch(`${API}/host/unban`, {method:'POST', headers: hostHeaders(), body: JSON.stringify({session_id: sessionId})});
+  refreshHostPanel();
+}
+function escA(s){return String(s).replace(/'/g,"\\'");}
 
 // ── Visualizer ───────────────────────────────────────────────────────────
 // createMediaElementSource irreversibly reroutes the <audio> element's
