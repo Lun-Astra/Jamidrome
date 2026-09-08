@@ -96,13 +96,13 @@ body::before{content:'';position:fixed;inset:0;
     padding:6px 12px;font-size:11px}
   .stage{padding:96px 20px 120px}
   .art-wrap{width:min(34vh,220px);height:min(34vh,220px);margin-bottom:20px}
-  #viz{height:60px}
+  #viz{height:180px}
   .up-next{bottom:max(16px,env(safe-area-inset-bottom));padding:0 16px}
   .un-item{max-width:150px}
   #audio-unlock{bottom:max(16px,env(safe-area-inset-bottom))}
 }
 
-#viz{width:min(70vw,520px);height:90px;margin:18px auto 0;display:block}
+#viz{width:min(70vw,520px);height:270px;margin:18px auto 0;display:block}
 
 #invite-modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:20;display:none;align-items:center;justify-content:center}
 #invite-modal.show{display:flex}
@@ -184,7 +184,7 @@ body::before{content:'';position:fixed;inset:0;
       <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
       <div class="times"><span id="t-elapsed">0:00</span><span id="t-total">0:00</span></div>
     </div>
-    <canvas id="viz" width="520" height="90"></canvas>
+    <canvas id="viz" width="520" height="270"></canvas>
   </div>
   <div id="idle-view" class="idle">
     <div class="big">Waiting for requests…</div>
