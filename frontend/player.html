@@ -825,13 +825,20 @@ function drawVisualizer(){
   // 50% volume -> ~84%).
   const VIZ_VOLUME_GAMMA = 0.25;
   const volScale = audio.muted ? 0 : Math.pow(audio.volume, VIZ_VOLUME_GAMMA);
+  // Separately from volume: most music rarely drives a given band's
+  // getByteFrequencyData reading anywhere near a full 255, so the line
+  // was generally sitting well short of the room it actually has — a flat
+  // gain here (clamped to 1 so it still tops out exactly at the baseline
+  // instead of clipping past it) makes typical peaks read taller overall,
+  // regardless of volume.
+  const VIZ_GAIN = 1.6;
 
   const heights = new Float32Array(count);
   for(let j = 0; j < count; j++){
     const [from, to] = barBins[j];
     let peak = 0;
     for(let i = from; i < to; i++) if(freqData[i] > peak) peak = freqData[i];
-    heights[j] = (peak / 255) * baseline * volScale;
+    heights[j] = Math.min(1, (peak / 255) * VIZ_GAIN) * baseline * volScale;
     peaks[j] = Math.max(heights[j], peaks[j] - baseline * 0.02); // gravity
   }
 
