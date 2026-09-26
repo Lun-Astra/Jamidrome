@@ -277,13 +277,17 @@ async function refreshQueue(){
     // client-side and isn't part of the response at all.
     const np = document.getElementById('now-playing');
     if(d.now_playing){
-      const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
+      // While paused the timeline stands still at pause_started_at (the server
+      // only shifts playback_started_at on resume), and server_time rather than
+      // this phone's clock keeps a phone with a wrong clock on the right spot.
+      const now = (d.paused && d.pause_started_at) ? d.pause_started_at : (d.server_time || Date.now()/1000);
+      const elapsed = d.playback_started_at ? Math.max(0, now - d.playback_started_at) : 0;
       const pct = d.now_playing.duration ? Math.min(100, elapsed/d.now_playing.duration*100) : 0;
       const sv = d.now_playing.skip_votes || 0, st = d.now_playing.skip_threshold || 1;
       np.innerHTML = `
         <img src="${esc(d.now_playing.thumbnail)}">
         <div style="flex:1;min-width:0">
-          <div class="np-title">${esc(d.now_playing.title)}</div>
+          <div class="np-title">${d.paused ? '<span style="color:var(--text2);font-weight:600">⏸ Paused · </span>' : ''}${esc(d.now_playing.title)}</div>
           <div class="np-artist">${esc(d.now_playing.artist)} · requested by ${esc(d.now_playing.requested_by)}</div>
           <div class="np-bar"><div class="np-bar-fill" style="width:${pct}%"></div></div>
         </div>
