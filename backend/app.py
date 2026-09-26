@@ -1601,6 +1601,8 @@ def route_queue_get():
         return jsonify({
             "server_time": time.time(),
             "speaker": _speaker_view(),
+            "pause_reason": state.get("pause_reason"),
+            "autofill_in_progress": _autofill_running,
             "now_playing": public_view(now_playing, include_stream=is_host, session_id=session_id) if now_playing else None,
             "playback_started_at": state["playback_started_at"],
             "paused": state["paused"],
