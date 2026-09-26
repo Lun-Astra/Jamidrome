@@ -181,11 +181,40 @@ def _prune_expired_host_tokens():
         del tokens[t]
 
 
+# The host PIN is short (it's typed on a TV), and the jam is on the internet: a
+# per-request sleep doesn't stop parallel guessing. So wrong PINs are counted
+# globally (across all clients) and PIN auth locks for everyone after too many.
+PIN_MAX_FAILURES = 10
+PIN_FAILURE_WINDOW_SEC = 600
+PIN_LOCKOUT_SEC = 600
+_pin_lock = threading.Lock()
+_pin_failures = []        # timestamps of recent wrong PINs
+_pin_locked_until = 0.0
+
+
+def _pin_ok(pin):
+    """Checks a host PIN with the global lockout. Returns (ok, error)."""
+    global _pin_locked_until
+    now = time.time()
+    with _pin_lock:
+        if now < _pin_locked_until:
+            return False, "Too many wrong PINs - PIN login is locked for a few minutes"
+        if JAM_HOST_PIN and pin and secrets.compare_digest(pin, JAM_HOST_PIN):
+            return True, None
+        _pin_failures[:] = [t for t in _pin_failures if now - t < PIN_FAILURE_WINDOW_SEC] + [now]
+        if len(_pin_failures) >= PIN_MAX_FAILURES:
+            _pin_locked_until = now + PIN_LOCKOUT_SEC
+            _pin_failures.clear()
+            print(f"[jam] {PIN_MAX_FAILURES} wrong host PINs in {PIN_FAILURE_WINDOW_SEC}s - "
+                  f"PIN login locked for {PIN_LOCKOUT_SEC}s", flush=True)
+        return False, "Wrong PIN"
+
+
 def _is_host():
     """Host = a valid host token (header, or ?key= for <audio src> which
     can't send headers) or the shared PIN header the web player page uses."""
     pin = request.headers.get("X-Jam-Host-Pin", "")
-    if JAM_HOST_PIN and pin and secrets.compare_digest(pin, JAM_HOST_PIN):
+    if pin and _pin_ok(pin)[0]:
         return True
     token = request.headers.get("X-Jam-Host-Token", "") or request.args.get("key", "")
     if not token:
@@ -1474,9 +1503,10 @@ def route_host_login():
     username = (data.get("username") or "").strip()
     pin = (data.get("pin") or "").strip()
     if pin:
-        if not (JAM_HOST_PIN and secrets.compare_digest(pin, JAM_HOST_PIN)):
-            time.sleep(1)  # cheap brake on PIN guessing
-            return jsonify({"error": "Wrong PIN"}), 403
+        ok, err = _pin_ok(pin)
+        if not ok:
+            time.sleep(1)
+            return jsonify({"error": err}), 403
         username = "pin"
     elif username:
         ok, err = _verify_navidrome_user(username, password=data.get("password"),
