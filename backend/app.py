@@ -77,6 +77,23 @@ MAX_INVITE_TTL_SEC   = 7 * 24 * 3600
 # request/vote."
 JAM_HOST_PIN = os.environ.get("JAM_HOST_PIN", "")
 
+# Once the jam is reachable from the internet, "can reach the page" no longer
+# means "was invited" — every guest route requires a live invite token (or
+# host auth). Set JAM_REQUIRE_INVITE=0 to go back to the old open-LAN mode.
+JAM_REQUIRE_INVITE = os.environ.get("JAM_REQUIRE_INVITE", "1").strip().lower() not in ("0", "false", "no", "")
+
+# Host login for apps (LunaDrome): Navidrome credentials, verified against
+# Navidrome itself, exchanged for a long-lived random host token. Empty
+# JAM_HOST_USERS = any Navidrome *admin* may host; otherwise a comma-separated
+# allowlist of usernames.
+JAM_HOST_USERS = {u.strip().lower() for u in os.environ.get("JAM_HOST_USERS", "").split(",") if u.strip()}
+HOST_TOKEN_TTL_SEC = 90 * 24 * 3600
+
+# Only one device plays the jam at a time (the "speaker"). It heartbeats
+# every few seconds; if it goes quiet for this long, the jam pauses right
+# where it was instead of the watchdog playing songs into the void.
+SPEAKER_TIMEOUT_SEC = 20
+
 REACTION_EMOJIS      = {"🔥", "❤️", "😂", "👏", "🎉", "💃"}
 REACTION_COOLDOWN_SEC = 1.5   # per session — keeps one person from flooding
                               # the shared screen with a single held-down tap
@@ -95,9 +112,16 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # banned_sessions: session_ids the host has kicked — checked wherever a
 #          session_id could otherwise request/upvote/skip-vote; doesn't
 #          revoke anything already queued, just blocks new interactions.
+# host_tokens: token -> {user, label, created_at, expires_at} — minted by
+#          /host/login for apps that authenticated with Navidrome creds or the PIN.
+# speaker: {device_id, name, last_seen} of the one device currently playing
+#          the jam, or None — see SPEAKER_TIMEOUT_SEC.
+# pause_reason: "host" (someone pressed pause) or "no_speaker" (auto-pause);
+#          only the latter is undone automatically when a speaker claims.
 state_lock = threading.Lock()
 state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None, "invites": {},
-         "paused": False, "pause_started_at": None, "autoplay_enabled": True, "banned_sessions": []}
+         "paused": False, "pause_started_at": None, "autoplay_enabled": True, "banned_sessions": [],
+         "host_tokens": {}, "speaker": None, "pause_reason": None}
 
 # Live emoji reactions fired from the request page and animated over the
 # player page — deliberately kept out of `state`/state.json entirely rather
@@ -128,6 +152,10 @@ def load_state():
     state["playback_started_at"] = None
     state["paused"] = False
     state["pause_started_at"] = None
+    state["pause_reason"] = None
+    # Whatever device was the speaker has to claim again after a restart.
+    state["speaker"] = None
+    state.setdefault("host_tokens", {})
     for item in state["queue"]:
         if item.get("status") == "playing":
             item["status"] = "ready"
@@ -145,17 +173,114 @@ def find_item(item_id):
     return None
 
 
-def _require_host_pin():
-    """Gate for every /host/* route. Returns a Flask response to abort the
-    request with, or None to let it proceed. Unconfigured (no JAM_HOST_PIN
-    set) fails closed rather than falling back to "no check" — better to
-    make Luna go set it than to silently ship moderation routes nobody
-    can actually reach but that also aren't protected."""
-    if not JAM_HOST_PIN:
-        return jsonify({"error": "Host controls aren't configured — set JAM_HOST_PIN in .env"}), 503
-    if request.headers.get("X-Jam-Host-Pin", "") != JAM_HOST_PIN:
-        return jsonify({"error": "Wrong PIN"}), 403
-    return None
+def _prune_expired_host_tokens():
+    """Must be called with state_lock held."""
+    now = time.time()
+    tokens = state.setdefault("host_tokens", {})
+    for t in [t for t, v in tokens.items() if v.get("expires_at", 0) <= now]:
+        del tokens[t]
+
+
+def _is_host():
+    """Host = a valid host token (header, or ?key= for <audio src> which
+    can't send headers) or the shared PIN header the web player page uses."""
+    pin = request.headers.get("X-Jam-Host-Pin", "")
+    if JAM_HOST_PIN and pin and secrets.compare_digest(pin, JAM_HOST_PIN):
+        return True
+    token = request.headers.get("X-Jam-Host-Token", "") or request.args.get("key", "")
+    if not token:
+        return False
+    with state_lock:
+        info = (state.get("host_tokens") or {}).get(token)
+        return bool(info) and info.get("expires_at", 0) > time.time()
+
+
+def _require_host():
+    """Gate for every host-only route. Returns a Flask response to abort
+    the request with, or None to let it proceed."""
+    if _is_host():
+        return None
+    return jsonify({"error": "Host login required"}), 401
+
+
+# Kept for the existing /host/* moderation routes below.
+_require_host_pin = _require_host
+
+
+def _invite_token_from_request():
+    return request.headers.get("X-Jam-Invite", "") or request.args.get("invite", "")
+
+
+def _require_guest():
+    """Gate for guest routes (search, request, vote, react): a live invite
+    token or host auth. Open to anyone when JAM_REQUIRE_INVITE is off."""
+    if not JAM_REQUIRE_INVITE or _is_host():
+        return None
+    token = _invite_token_from_request()
+    if token:
+        with state_lock:
+            _prune_expired_invites()
+            if token in state["invites"]:
+                return None
+    return jsonify({"error": "This jam needs a valid invite link", "invite_required": True}), 401
+
+
+def _verify_navidrome_user(username, password=None, token=None, salt=None):
+    """Checks the given Navidrome credentials against Navidrome itself and
+    returns (ok, error). Also enforces who may host: JAM_HOST_USERS if set,
+    otherwise Navidrome admins only."""
+    if not NAVIDROME_URL:
+        return False, "NAVIDROME_URL isn't configured"
+    params = {"u": username, "v": "1.16.1", "c": "jamidrome", "f": "json"}
+    if token and salt:
+        params.update(t=token, s=salt)
+    elif password:
+        params["p"] = password
+    else:
+        return False, "Missing credentials"
+    try:
+        resp = http.get(f"{NAVIDROME_URL}/rest/getUser", params={**params, "username": username}, timeout=10)
+        body = resp.json().get("subsonic-response", {})
+    except Exception:
+        return False, "Couldn't reach Navidrome"
+    if body.get("status") != "ok":
+        return False, (body.get("error") or {}).get("message") or "Wrong username or password"
+    user = body.get("user") or {}
+    if JAM_HOST_USERS:
+        if username.lower() not in JAM_HOST_USERS:
+            return False, "This account isn't allowed to host the jam"
+    elif not user.get("adminRole"):
+        return False, "Only Navidrome admins can host the jam"
+    return True, None
+
+
+def _speaker_alive():
+    """Must be called with state_lock held."""
+    sp = state.get("speaker")
+    return bool(sp) and time.time() - sp.get("last_seen", 0) <= SPEAKER_TIMEOUT_SEC
+
+
+def _pause_locked(reason):
+    """Must be called with state_lock held."""
+    if state["now_playing_id"] and not state["paused"]:
+        state["paused"] = True
+        state["pause_started_at"] = time.time()
+        state["pause_reason"] = reason
+
+
+def _resume_locked():
+    """Must be called with state_lock held."""
+    if state["paused"] and state["pause_started_at"] is not None:
+        paused_for = time.time() - state["pause_started_at"]
+        if state["playback_started_at"] is not None:
+            # Shifts the "clock" forward by however long it was paused,
+            # so elapsed = now - playback_started_at keeps meaning
+            # "how much of the track has actually played", not
+            # counting the paused interval as elapsed playback time.
+            state["playback_started_at"] += paused_for
+    state["paused"] = False
+    state["pause_started_at"] = None
+    state["pause_reason"] = None
 
 
 def _is_banned(session_id):
@@ -165,6 +290,8 @@ def _is_banned(session_id):
 def public_view(item, include_stream=False, session_id=None):
     v = {k: item.get(k) for k in ("id", "video_id", "title", "artist", "thumbnail", "album", "genre",
                                    "duration", "status", "requested_by", "added_at", "progress")}
+    v["navidrome_song_id"] = item.get("navidrome_song_id")
+    v["source"] = "library" if str(item.get("video_id") or "").startswith("nd:") else "youtube"
     upvotes = item.get("upvotes") or []
     v["votes"] = len(upvotes)
     v["voted_by_me"] = bool(session_id) and session_id in upvotes
@@ -756,12 +883,20 @@ def _autofill_seed_video_id():
     every track has one, even a Navidrome-match one; see _enqueue_track.
     None if this jam has no history yet at all and nothing is playing."""
     cur = find_item(state["now_playing_id"]) if state["now_playing_id"] else None
-    if cur and cur.get("video_id"):
-        return cur["video_id"]
-    for item in reversed(state["history"]):
-        if item.get("video_id"):
-            return item["video_id"]
+    for item in ([cur] if cur else []) + list(reversed(state["history"])):
+        seed = _youtube_video_id(item)
+        if seed:
+            return seed
     return None
+
+
+def _youtube_video_id(item):
+    """A track added from the Navidrome library has a synthetic "nd:<id>"
+    video_id; Auto DJ can only seed from a real YouTube id, which gets
+    resolved in the background for those (yt_video_id) — see
+    _resolve_youtube_id_bg."""
+    vid = item.get("yt_video_id") or item.get("video_id") or ""
+    return None if vid.startswith("nd:") else (vid or None)
 
 
 def _navidrome_host_free_gb():
@@ -1042,11 +1177,7 @@ NAVIDROME_DB_PATH = "/var/lib/navidrome/navidrome.db"
 
 def cleanup_jam_folder():
     """Deletes the oldest files in Jam/ until it's back under
-    JAM_FOLDER_MAX_BYTES, then removes the Navidrome DB rows for exactly
-    the files just deleted — a plain rescan doesn't reliably prune a row
-    whose file just vanished out from under it here (the same lesson
-    Spotidrome's own dedupe jobs learned the hard way), only a direct
-    delete does — and triggers a rescan. Best-effort throughout: any
+    JAM_FOLDER_MAX_BYTES and triggers a full rescan. Best-effort throughout: any
     failure just means trying again next interval, never something that
     should affect playback."""
     if not (SSH_HOST and SSH_USER):
@@ -1084,14 +1215,11 @@ def cleanup_jam_folder():
         subprocess.run(_ssh_cmd(f"rm -f -- {quoted_paths}"), capture_output=True, timeout=30)
         print(f"[jam] Cleaned up {len(to_delete)} old Jam/ file(s), freed ~{freed / 1024**2:.0f}MB", flush=True)
 
-        # Direct DB delete for exactly the files just removed — see the
-        # docstring above for why a scan alone isn't enough here.
-        conditions = " OR ".join(
-            "path = '{}/{}'" .format(NAV_SUBFOLDER, fn.replace("'", "''")) for fn in to_delete)
-        sql = f"DELETE FROM media_file WHERE {conditions};"
-        subprocess.run(_ssh_cmd(f"sqlite3 {NAVIDROME_DB_PATH} {shlex.quote(sql)}"),
-                        capture_output=True, timeout=20)
-
+        # No direct DB delete here any more: writing navidrome.db with the
+        # sqlite3 CLI corrupts it (the CLI's SQLite computes expression-index
+        # keys differently from Navidrome's bundled one → "database disk
+        # image is malformed", scans silently rolled back for a month). A
+        # full scan marks the vanished files missing, which hides them.
         if NAVIDROME_URL and NAVIDROME_USER:
             http.put(f"{NAVIDROME_URL}/api/scanner/trigger",
                       auth=(NAVIDROME_USER, NAVIDROME_PASSWORD), params={"fullScan": "true"}, timeout=15)
@@ -1131,27 +1259,25 @@ def _promote_next_if_idle():
         nxt["status"] = "playing"
         state["now_playing_id"] = nxt["id"]
         state["playback_started_at"] = time.time()
+        # Nobody is listening — start the new track paused at 0:00 so it's
+        # still there, unheard, when a speaker claims the jam.
+        if not _speaker_alive():
+            _pause_locked("no_speaker")
 
 
 def pause_playback():
     with state_lock:
         if state["now_playing_id"] and not state["paused"]:
-            state["paused"] = True
-            state["pause_started_at"] = time.time()
+            _pause_locked("host")
             save_state()
 
 def resume_playback():
     with state_lock:
-        if state["paused"] and state["pause_started_at"] is not None:
-            paused_for = time.time() - state["pause_started_at"]
-            if state["playback_started_at"] is not None:
-                # Shifts the "clock" forward by however long it was paused,
-                # so elapsed = now - playback_started_at keeps meaning
-                # "how much of the track has actually played", not
-                # counting the paused interval as elapsed playback time.
-                state["playback_started_at"] += paused_for
-            state["paused"] = False
-            state["pause_started_at"] = None
+        if state["paused"]:
+            _resume_locked()
+            if not _speaker_alive():
+                # Resuming with no speaker would just play into the void.
+                _pause_locked("no_speaker")
             save_state()
 
 
@@ -1187,6 +1313,7 @@ def advance(expected_id=None):
         # paused no longer applies.
         state["paused"] = False
         state["pause_started_at"] = None
+        state["pause_reason"] = None
         _promote_next_if_idle()
         save_state()
 
@@ -1253,6 +1380,17 @@ def watchdog_loop():
     while True:
         time.sleep(2)
         with state_lock:
+            # Option A: the speaker went quiet (app closed, PC asleep, phone
+            # lost signal) — pause where we are instead of auto-advancing
+            # through songs nobody hears.
+            if state.get("speaker") and not _speaker_alive():
+                print(f"[jam] Speaker {state['speaker'].get('name')!r} timed out — pausing", flush=True)
+                state["speaker"] = None
+                _pause_locked("no_speaker")
+                save_state()
+            elif not state.get("speaker") and state["now_playing_id"] and not state["paused"]:
+                _pause_locked("no_speaker")
+                save_state()
             cur_id = state["now_playing_id"]
             started = state["playback_started_at"]
             paused = state["paused"]
@@ -1290,11 +1428,159 @@ def _request_page_url():
     return f"http://{hostname}:9998/"
 
 
+# ─── Access control ──────────────────────────────────────────────────────────
+# One gate for every route, deny-by-default: anything not listed as public or
+# guest is host-only, so a route added later can't accidentally ship open to
+# the internet.
+
+PUBLIC_ENDPOINTS = {"route_config", "route_invite_consume", "route_cover", "route_host_login", "static"}
+GUEST_ENDPOINTS = {"route_search", "route_queue_get", "route_queue_add", "route_queue_add_library",
+                   "route_queue_upvote", "route_vote_skip", "route_requeue", "route_queue_remove",
+                   "route_reaction_send", "route_invite_check"}
+
+
+@app.before_request
+def _access_gate():
+    if request.method == "OPTIONS" or request.endpoint is None:
+        return None  # CORS preflight / 404s
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+    if request.endpoint in GUEST_ENDPOINTS:
+        return _require_guest()
+    return _require_host()
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.route("/config")
 def route_config():
-    return jsonify({"request_page_url": REQUEST_PAGE_URL or None})
+    return jsonify({"request_page_url": REQUEST_PAGE_URL or None, "invite_required": JAM_REQUIRE_INVITE,
+                    "host_pin_enabled": bool(JAM_HOST_PIN)})
+
+
+@app.route("/invite/check")
+def route_invite_check():
+    """Lets the request page tell "valid invite" from "expired" up front."""
+    return jsonify({"ok": True})
+
+
+# ─── Host login & speaker ────────────────────────────────────────────────────
+
+@app.route("/host/login", methods=["POST"])
+def route_host_login():
+    """Exchanges Navidrome credentials ({username, password} or Subsonic
+    {username, token, salt}) or the host PIN ({pin}) for a host token."""
+    data = request.json or {}
+    username = (data.get("username") or "").strip()
+    pin = (data.get("pin") or "").strip()
+    if pin:
+        if not (JAM_HOST_PIN and secrets.compare_digest(pin, JAM_HOST_PIN)):
+            time.sleep(1)  # cheap brake on PIN guessing
+            return jsonify({"error": "Wrong PIN"}), 403
+        username = "pin"
+    elif username:
+        ok, err = _verify_navidrome_user(username, password=data.get("password"),
+                                         token=data.get("token"), salt=data.get("salt"))
+        if not ok:
+            time.sleep(1)
+            return jsonify({"error": err}), 403
+    else:
+        return jsonify({"error": "username or pin required"}), 400
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    with state_lock:
+        _prune_expired_host_tokens()
+        state["host_tokens"][token] = {"user": username, "label": (data.get("label") or "")[:60],
+                                       "created_at": now, "expires_at": now + HOST_TOKEN_TTL_SEC}
+        save_state()
+    return jsonify({"token": token, "user": username, "expires_at": now + HOST_TOKEN_TTL_SEC})
+
+
+@app.route("/host/logout", methods=["POST"])
+def route_host_logout():
+    token = request.headers.get("X-Jam-Host-Token", "")
+    with state_lock:
+        state["host_tokens"].pop(token, None)
+        save_state()
+    return jsonify({"ok": True})
+
+
+def _speaker_view():
+    """Must be called with state_lock held."""
+    sp = state.get("speaker")
+    if not sp or not _speaker_alive():
+        return None
+    return {"device_id": sp["device_id"], "name": sp.get("name") or "Unknown device"}
+
+
+@app.route("/speaker/claim", methods=["POST"])
+def route_speaker_claim():
+    """Makes the calling device the one speaker ("Play here"). Takes over
+    from any other device immediately — it finds out on its next
+    heartbeat and stops. Undoes an auto-pause, never a host pause."""
+    data = request.json or {}
+    device_id = (data.get("device_id") or "").strip()[:80]
+    if not device_id:
+        return jsonify({"error": "device_id required"}), 400
+    with state_lock:
+        state["speaker"] = {"device_id": device_id, "name": (data.get("name") or "")[:60],
+                            "last_seen": time.time()}
+        if state["paused"] and state.get("pause_reason") == "no_speaker":
+            _resume_locked()
+        _promote_next_if_idle()
+        save_state()
+        return jsonify({"active": True, "speaker": _speaker_view(), "server_time": time.time()})
+
+
+@app.route("/speaker/heartbeat", methods=["POST"])
+def route_speaker_heartbeat():
+    """Sent every few seconds by the active speaker. active=false means
+    another device took over (or it timed out) — stop playing."""
+    device_id = ((request.json or {}).get("device_id") or "").strip()
+    with state_lock:
+        sp = state.get("speaker")
+        active = bool(sp) and sp["device_id"] == device_id and _speaker_alive()
+        if active:
+            sp["last_seen"] = time.time()
+        return jsonify({"active": active, "speaker": _speaker_view(), "server_time": time.time()})
+
+
+@app.route("/speaker/release", methods=["POST"])
+def route_speaker_release():
+    """Graceful stop (app closing, "Stop playing here") — pause right away
+    instead of waiting out SPEAKER_TIMEOUT_SEC."""
+    device_id = ((request.json or {}).get("device_id") or "").strip()
+    with state_lock:
+        sp = state.get("speaker")
+        if sp and sp["device_id"] == device_id:
+            state["speaker"] = None
+            _pause_locked("no_speaker")
+            save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/jam/end", methods=["POST"])
+def route_jam_end():
+    """Ends the jam: clears the queue and what's playing, revokes every
+    invite link and drops the speaker. History stays for ↺ requeue."""
+    with state_lock:
+        for item in state["queue"]:
+            if item["status"] == "downloading":
+                item["removed"] = True  # worker loop discards it when done
+            else:
+                threading.Timer(1, _cleanup_downloaded_files, args=(item["id"],)).start()
+        state["queue"] = [i for i in state["queue"] if i["status"] == "downloading"]
+        state["now_playing_id"] = None
+        state["playback_started_at"] = None
+        state["paused"] = False
+        state["pause_started_at"] = None
+        state["pause_reason"] = None
+        state["invites"] = {}
+        state["speaker"] = None
+        # Otherwise Auto DJ would refill the "ended" jam straight away.
+        state["autoplay_enabled"] = False
+        save_state()
+    return jsonify({"ok": True})
 
 
 @app.route("/search")
@@ -1308,11 +1594,14 @@ def route_search():
 @app.route("/queue", methods=["GET"])
 def route_queue_get():
     session_id = request.headers.get("X-Jam-Session", "")
+    is_host = _is_host()  # outside state_lock — _is_host takes it itself
     with state_lock:
         now_playing = find_item(state["now_playing_id"]) if state["now_playing_id"] else None
         upcoming = sorted((i for i in state["queue"] if i["status"] != "playing"), key=_queue_sort_key)
         return jsonify({
-            "now_playing": public_view(now_playing, include_stream=True, session_id=session_id) if now_playing else None,
+            "server_time": time.time(),
+            "speaker": _speaker_view(),
+            "now_playing": public_view(now_playing, include_stream=is_host, session_id=session_id) if now_playing else None,
             "playback_started_at": state["playback_started_at"],
             "paused": state["paused"],
             "pause_started_at": state["pause_started_at"],
@@ -1403,6 +1692,106 @@ def route_queue_add():
     return jsonify(public_view(item, session_id=session_id))
 
 
+def _navidrome_get_song(song_id):
+    try:
+        resp = http.get(f"{NAVIDROME_URL}/rest/getSong", params={
+            "id": song_id, "u": NAVIDROME_USER, "p": NAVIDROME_PASSWORD,
+            "v": "1.16.1", "c": "jamidrome", "f": "json"}, timeout=10)
+        body = resp.json().get("subsonic-response", {})
+        return body.get("song") if body.get("status") == "ok" else None
+    except Exception:
+        return None
+
+
+def _resolve_youtube_id_bg(item_id, title, artist):
+    """Library tracks have no YouTube id, but Auto DJ seeds its "radio"
+    from one — look the song up on YT Music once, in the background."""
+    try:
+        results = _search_ytmusic_songs(f"{artist} {title}", 3)
+        match = next((r for r in results if _title_close_enough(r["title"], title)), None)
+        if not match:
+            return
+        with state_lock:
+            for item in state["queue"] + state["history"]:
+                if item["id"] == item_id:
+                    item["yt_video_id"] = match["video_id"]
+                    save_state()
+                    break
+    except Exception as e:
+        print(f"[jam] YouTube id lookup failed for {artist} - {title}: {e}", flush=True)
+
+
+def _enqueue_library(song_id, requested_by="Anonymous", session_id=None):
+    """Queues a song straight from the Navidrome library — no search, no
+    download; it streams from Navidrome through /stream/<id>."""
+    if _is_banned(session_id):
+        return None, ("You've been removed from this jam by the host", 403)
+    song = _navidrome_get_song(song_id)
+    if not song:
+        return None, ("That song wasn't found in the library", 404)
+    video_id = f"nd:{song_id}"
+    item_id = uuid.uuid4().hex[:12]
+    with state_lock:
+        active_ids = {i["video_id"] for i in state["queue"] if i["status"] in ("queued", "downloading", "ready", "playing")}
+        if video_id in active_ids:
+            return None, ("That song is already in the queue", 409)
+        item = {
+            "id": item_id, "video_id": video_id, "url": None,
+            "title": song.get("title") or "Unknown title",
+            "artist": song.get("artist") or "Unknown artist",
+            "album": song.get("album"), "genre": song.get("genre"),
+            "duration": song.get("duration"),
+            # Relative on purpose: served by /cover/<id>, which proxies
+            # Navidrome's cover art without exposing its credentials.
+            "thumbnail": f"/api/cover/{item_id}",
+            "navidrome_song_id": song_id, "cover_art_id": song.get("coverArt") or song_id,
+            "requested_by": (requested_by or "Anonymous").strip()[:40] or "Anonymous",
+            "session_id": session_id, "added_at": time.time(), "progress": 100,
+            "status": "ready",
+        }
+        state["queue"].append(item)
+        _promote_next_if_idle()
+        save_state()
+    threading.Thread(target=_resolve_youtube_id_bg, args=(item_id, item["title"], item["artist"]),
+                     daemon=True).start()
+    return item, None
+
+
+@app.route("/queue/add-library", methods=["POST"])
+def route_queue_add_library():
+    data = request.json or {}
+    song_id = (data.get("song_id") or "").strip()
+    if not song_id:
+        return jsonify({"error": "song_id is required"}), 400
+    session_id = request.headers.get("X-Jam-Session", "")
+    item, err = _enqueue_library(song_id, data.get("requested_by"), session_id)
+    if err:
+        message, status = err
+        return jsonify({"error": message}), status
+    return jsonify(public_view(item, session_id=session_id))
+
+
+@app.route("/cover/<item_id>")
+def route_cover(item_id):
+    """Cover art for a library-added track. Public (an <img> can't send
+    auth headers) but only for ids that are in this jam's queue/history."""
+    with state_lock:
+        item = next((i for i in state["queue"] + state["history"] if i["id"] == item_id), None)
+        cover_id = item.get("cover_art_id") if item else None
+    if not cover_id:
+        abort(404)
+    try:
+        upstream = http.get(f"{NAVIDROME_URL}/rest/getCoverArt", params={
+            "id": cover_id, "size": 600, "u": NAVIDROME_USER, "p": NAVIDROME_PASSWORD,
+            "v": "1.16.1", "c": "jamidrome"}, timeout=15)
+    except Exception:
+        abort(502)
+    if upstream.status_code != 200:
+        abort(404)
+    return Response(upstream.content, mimetype=upstream.headers.get("Content-Type", "image/jpeg"),
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.route("/queue/<item_id>/upvote", methods=["POST"])
 def route_queue_upvote(item_id):
     """Toggles this session's upvote on a not-yet-playing item — call again
@@ -1471,6 +1860,13 @@ def route_requeue(item_id):
     data = request.json or {}
     requested_by = data.get("requested_by") or hist_item.get("requested_by") or "Anonymous"
 
+    if str(hist_item.get("video_id") or "").startswith("nd:"):
+        item, err = _enqueue_library(hist_item["navidrome_song_id"], requested_by, session_id)
+        if err:
+            message, status = err
+            return jsonify({"error": message}), status
+        return jsonify(public_view(item, session_id=session_id))
+
     item, err = _enqueue_track(
         hist_item["video_id"], hist_item["url"], hist_item["title"], hist_item["artist"],
         duration=hist_item.get("duration"), thumbnail=hist_item.get("thumbnail"),
@@ -1511,6 +1907,12 @@ def route_player_state():
             "pause_started_at": state["pause_started_at"],
             "autoplay_enabled": state.get("autoplay_enabled", True),
             "autofill_in_progress": _autofill_running,
+            "pause_reason": state.get("pause_reason"),
+            "speaker": _speaker_view(),
+            # Clients compute elapsed = server_time - playback_started_at
+            # (plus their own time since this response) so a device whose
+            # clock is off still lands on the right second.
+            "server_time": time.time(),
             "up_next": up_next,
         })
 
@@ -1568,6 +1970,8 @@ def _proxy_navidrome_stream(song_id):
         upstream = http.get(f"{NAVIDROME_URL}/rest/stream", params={
             "id": song_id, "u": NAVIDROME_USER, "p": NAVIDROME_PASSWORD,
             "v": "1.16.1", "c": "jamidrome",
+            # Optional transcoding for phones on mobile data (Navidrome does it).
+            **{k: request.args[k] for k in ("maxBitRate", "format") if request.args.get(k)},
         }, headers=headers, stream=True, timeout=30)
     except Exception:
         abort(502)
@@ -1617,25 +2021,22 @@ def route_invite_create():
 
 @app.route("/invite/list")
 def route_invite_list():
-    session_id = request.headers.get("X-Jam-Session", "")
     with state_lock:
         _prune_expired_invites()
         save_state()
-        invites = [{"token": t, **inv} for t, inv in state["invites"].items()
-                   if inv.get("session_id") == session_id]
+        # Host-only now, so every host sees every live link (web player page
+        # and LunaDrome alike), not just the ones this browser created.
+        invites = [{"token": t, **inv} for t, inv in state["invites"].items()]
     invites.sort(key=lambda i: i["created_at"], reverse=True)
     return jsonify({"invites": invites})
 
 
 @app.route("/invite/<token>/revoke", methods=["POST"])
 def route_invite_revoke(token):
-    session_id = request.headers.get("X-Jam-Session", "")
     with state_lock:
         inv = state["invites"].get(token)
-        # Only the session that created a link can revoke it — otherwise
-        # a browser that can't even see another session's link in its own
-        # list could still guess/target a token and kill someone else's.
-        if inv and inv.get("session_id") == session_id:
+        # Host-only route, so any host may revoke any link.
+        if inv:
             state["invites"].pop(token, None)
             save_state()
     return jsonify({"ok": True})
@@ -1661,7 +2062,10 @@ def route_invite_consume(token):
         _prune_expired_invites()
         valid = token in state["invites"]
     if valid:
-        return redirect(_request_page_url(), code=302)
+        # The request page keeps the token (localStorage) and sends it as
+        # X-Jam-Invite on every call — it may live on another hostname, so a
+        # cookie set here wouldn't reach it.
+        return redirect(f"{_request_page_url()}?invite={token}", code=302)
     return ("""<!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Jamidrome</title>

@@ -137,6 +137,38 @@ if(!SESSION_ID){
 }
 const SESSION_HEADERS = {'X-Jam-Session': SESSION_ID};
 
+// ── Invite token ─────────────────────────────────────────────────────────
+// The jam is reachable from the internet, so the API only answers people
+// who came in through an invite link: /invite/<token> redirects here with
+// ?invite=<token>, which is kept in localStorage and sent on every call.
+(() => {
+  const fromUrl = new URLSearchParams(location.search).get('invite');
+  if(fromUrl){
+    localStorage.setItem('jam_invite', fromUrl);
+    history.replaceState(null, '', location.pathname);
+  }
+})();
+const INVITE = localStorage.getItem('jam_invite') || '';
+const _fetch = window.fetch.bind(window);
+window.fetch = (url, opts = {}) => {
+  const isApi = typeof url === 'string' && url.startsWith(API);
+  if(isApi && INVITE) opts = {...opts, headers: {...(opts.headers || {}), 'X-Jam-Invite': INVITE}};
+  return _fetch(url, opts).then(r => {
+    if(isApi && r.status === 401) showInviteNeeded();
+    return r;
+  });
+};
+function showInviteNeeded(){
+  if(document.getElementById('invite-needed')) return;
+  const el = document.createElement('div');
+  el.id = 'invite-needed';
+  el.style.cssText = 'position:fixed;inset:0;z-index:50;background:#0d0d12;color:#f0f0f8;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;font-family:inherit';
+  el.innerHTML = INVITE
+    ? '<div><h2>This invite link has expired</h2><p style="color:#9090b0">Ask whoever\'s hosting for a fresh one.</p></div>'
+    : '<div><h2>You need an invite link</h2><p style="color:#9090b0">Ask whoever\'s hosting the jam to share one with you.</p></div>';
+  document.body.appendChild(el);
+}
+
 // Fixed set, mirrors REACTION_EMOJIS in backend/app.py — the server is the
 // actual source of truth (it rejects anything else with a 400) and doesn't
 // serve this list itself, so it just has to be kept in sync by hand if it

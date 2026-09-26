@@ -170,8 +170,25 @@ body::before{content:'';position:fixed;inset:0;
 <body>
 <div id="overlay">
   <div class="big"><span style="color:var(--sp)">Jam</span><span style="color:var(--text3)">→</span><span style="color:var(--nd)">Drome</span></div>
-  <div class="sub">Click anywhere to start the jam</div>
-  <button class="btn" onclick="startJam()">▶ Start</button>
+  <div id="ov-start" style="display:contents">
+    <div class="sub">Click anywhere to start the jam</div>
+    <button class="btn" onclick="startJam()">▶ Start</button>
+  </div>
+  <div id="ov-login" style="display:none;text-align:center">
+    <div class="sub">Enter the host PIN to play the jam on this screen</div>
+    <input id="ov-pin" type="password" inputmode="numeric" placeholder="PIN" autocomplete="off"
+      style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:15px;outline:none;width:180px;text-align:center;margin:14px 0 6px">
+    <div id="ov-err" style="color:#f87171;font-size:12px;min-height:16px;margin-bottom:10px"></div>
+    <button class="btn" onclick="hostLogin()">Unlock</button>
+  </div>
+</div>
+
+<!-- Only one device plays the jam at a time (LunaDrome, another browser…).
+     Shown when another device took over; "Play here" takes it back. -->
+<div id="takeover" style="display:none;position:fixed;inset:0;z-index:9;background:rgba(13,13,18,.92);align-items:center;justify-content:center;flex-direction:column;gap:16px;text-align:center;padding:24px">
+  <div style="font-size:22px;font-weight:700">🔈 Playing on <span id="takeover-name">another device</span></div>
+  <div style="color:var(--text2);font-size:14px">This screen is paused while the jam plays there.</div>
+  <button onclick="playHere()" style="background:var(--sp);color:#06210f;border:none;border-radius:40px;padding:14px 32px;font-size:15px;font-weight:700;cursor:pointer">▶ Play here</button>
 </div>
 
 <div class="logo"><span class="j">Jam</span><span class="arr">→</span><span class="d">Drome</span></div>
@@ -268,6 +285,117 @@ if(!SESSION_ID){
   localStorage.setItem('jam_session_id', SESSION_ID);
 }
 const SESSION_HEADERS = {'X-Jam-Session': SESSION_ID};
+
+// ── Host auth ────────────────────────────────────────────────────────────
+// Every player route is host-only now that the jam is reachable from the
+// internet. The PIN is exchanged once for a host token (localStorage), and
+// every /api call gets it attached here instead of at each fetch site.
+let HOST_TOKEN = localStorage.getItem('jam_host_token') || '';
+const _fetch = window.fetch.bind(window);
+window.fetch = (url, opts = {}) => {
+  const isApi = typeof url === 'string' && url.startsWith(API);
+  if(isApi && HOST_TOKEN){
+    opts = {...opts, headers: {...(opts.headers || {}), 'X-Jam-Host-Token': HOST_TOKEN}};
+  }
+  return _fetch(url, opts).then(r => {
+    if(isApi && r.status === 401 && !url.includes('/host/login')) onHostAuthLost();
+    return r;
+  });
+};
+// <audio>/<img> can't send headers — the token rides along as ?key=.
+function withKey(u){ return u ? `${u}${u.includes('?') ? '&' : '?'}key=${encodeURIComponent(HOST_TOKEN)}` : u; }
+
+function showLoginGate(){
+  document.getElementById('overlay').style.display = 'flex';
+  document.getElementById('ov-start').style.display = 'none';
+  document.getElementById('ov-login').style.display = 'block';
+  setTimeout(() => document.getElementById('ov-pin').focus(), 50);
+}
+function onHostAuthLost(){
+  if(!HOST_TOKEN) return;
+  HOST_TOKEN = '';
+  localStorage.removeItem('jam_host_token');
+  isSpeaker = false;
+  audio.pause();
+  showLoginGate();
+}
+async function hostLogin(){
+  const pin = document.getElementById('ov-pin').value.trim();
+  const err = document.getElementById('ov-err');
+  err.textContent = '';
+  try{
+    const r = await fetch(`${API}/host/login`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pin, label: `Web player (${location.hostname})`})});
+    const d = await r.json();
+    if(!r.ok){ err.textContent = d.error || 'Login failed'; return; }
+    HOST_TOKEN = d.token;
+    localStorage.setItem('jam_host_token', HOST_TOKEN);
+    // Also unlocks the Host panel without asking for the PIN again.
+    localStorage.setItem('jam_host_pin', pin);
+    hostPin = pin;
+    document.getElementById('ov-login').style.display = 'none';
+    document.getElementById('ov-start').style.display = 'contents';
+  }catch(e){ err.textContent = 'Could not reach the jam server'; }
+}
+document.getElementById('ov-pin').addEventListener('keydown', e => { if(e.key === 'Enter') hostLogin(); });
+if(!HOST_TOKEN) showLoginGate();
+
+// ── Speaker (one device plays the jam at a time) ─────────────────────────
+// Claiming makes this page the speaker; a heartbeat every 5s keeps it. If
+// another device (e.g. LunaDrome) claims, the heartbeat says so and this
+// page goes quiet. If this page disappears, the server pauses the jam
+// after ~20s instead of playing songs to nobody.
+let DEVICE_ID = localStorage.getItem('jam_device_id');
+if(!DEVICE_ID){ DEVICE_ID = `web-${SESSION_ID}`; localStorage.setItem('jam_device_id', DEVICE_ID); }
+const DEVICE_NAME = `Web player (${location.hostname})`;
+let isSpeaker = false;
+let heartbeatTimer = null;
+let clockOffset = 0; // server clock minus this device's clock, in seconds
+function serverNow(){ return Date.now()/1000 + clockOffset; }
+
+async function claimSpeaker(){
+  try{
+    const r = await fetch(`${API}/speaker/claim`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({device_id: DEVICE_ID, name: DEVICE_NAME})});
+    if(!r.ok) return false;
+    isSpeaker = true;
+    document.getElementById('takeover').style.display = 'none';
+    if(!heartbeatTimer) heartbeatTimer = setInterval(heartbeat, 5000);
+    return true;
+  }catch(e){ return false; }
+}
+async function heartbeat(){
+  if(!isSpeaker) return;
+  try{
+    const r = await fetch(`${API}/speaker/heartbeat`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({device_id: DEVICE_ID})});
+    if(!r.ok) return;
+    const d = await r.json();
+    if(!d.active) lostSpeaker(d.speaker);
+  }catch(e){}
+}
+function lostSpeaker(sp){
+  isSpeaker = false;
+  audio.pause();
+  try{ if(crossfadeActive) abortCrossfade(); }catch(e){}
+  document.getElementById('takeover-name').textContent = (sp && sp.name) || 'another device';
+  document.getElementById('takeover').style.display = 'flex';
+}
+async function playHere(){
+  if(await claimSpeaker()){
+    currentId = null; // force a reload at the shared timeline's current second
+    try{ const r = await fetch(`${API}/player/state`); render(await r.json()); }catch(e){}
+  }
+}
+// Closing the tab pauses the jam right away instead of after the timeout.
+window.addEventListener('pagehide', () => {
+  if(!isSpeaker) return;
+  try{
+    fetch(`${API}/speaker/release`, {method:'POST', keepalive:true, headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({device_id: DEVICE_ID})});
+  }catch(e){}
+});
+
 (async () => {
   const hint = document.getElementById('host-hint');
   hint.textContent = `${location.hostname}:9998`; // fallback until /config resolves (or if it fails)
@@ -275,6 +403,8 @@ const SESSION_HEADERS = {'X-Jam-Session': SESSION_ID};
     const r = await fetch(`${API}/config`);
     const d = await r.json();
     if(d.request_page_url) hint.textContent = new URL(d.request_page_url).host;
+    // Guests can only get in through an invite link now.
+    if(d.invite_required) hint.parentElement.textContent = 'Share an invite link (🔗 Invite) so people can add songs';
   }catch(e){}
 })();
 
@@ -305,6 +435,8 @@ updateMuteIcon();
 // the outside), show a real button whenever a play() call is rejected so
 // there's always a working way to actually start the sound.
 function tryPlay(){
+  // Another device is the speaker — this page must stay silent.
+  if(!isSpeaker) return;
   // Defensive: re-attempt resuming the AudioContext on every track change
   // too, not just once at start — if it ever silently stayed suspended,
   // this keeps giving it another chance rather than staying silent forever.
@@ -411,7 +543,7 @@ function maybePreloadNext(upNext){
   if(!next || !next.stream_url || next.status !== 'ready' || next.id === preloadedNextId) return;
   preloadedNextId = next.id;
   preloadedNextItem = next;
-  preloadEl.src = next.stream_url;
+  preloadEl.src = withKey(next.stream_url);
   preloadEl.load();
 }
 
@@ -540,6 +672,9 @@ async function startJam(){
   audio.muted = false;
   setupAudioGraph();
   try{ if(audioCtx && audioCtx.state === 'suspended') await audioCtx.resume(); }catch(e){}
+  // Pressing Start means "play the jam here" — take over as the speaker
+  // (this also un-pauses a jam that auto-paused for lack of one).
+  await claimSpeaker();
   // Fetch + play chained directly from this click (not via a later
   // setTimeout) so the very first real playback is as tightly linked to
   // the user gesture as possible — the safest way to get autoplay allowed.
@@ -567,6 +702,7 @@ async function poll(){
 
 function render(d){
   const np = d.now_playing;
+  if(typeof d.server_time === 'number') clockOffset = d.server_time - Date.now()/1000;
   document.getElementById('playing-view').style.display = np ? 'flex' : 'none';
   document.getElementById('idle-view').style.display = np ? 'none' : 'block';
   document.getElementById('skip-btn').style.display = np ? 'block' : 'none';
@@ -614,8 +750,8 @@ function render(d){
       // Seek to wherever the shared timeline already is — this is a fresh
       // <audio> load (new track, or this page just loaded/reloaded mid-
       // track), so without this it would always start over from 0:00.
-      const elapsed = d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0;
-      audio.src = np.stream_url;
+      const elapsed = d.playback_started_at ? (serverNow() - d.playback_started_at) : 0;
+      audio.src = withKey(np.stream_url);
       audio.addEventListener('loadedmetadata', function seekOnce(){
         audio.currentTime = elapsed;
         if(!jamPaused) tryPlay();
@@ -636,7 +772,7 @@ function render(d){
     // just keep growing even though nothing is actually still playing.
     const elapsed = (d.paused && d.pause_started_at)
       ? (d.pause_started_at - d.playback_started_at)
-      : (d.playback_started_at ? (Date.now()/1000 - d.playback_started_at) : 0);
+      : (d.playback_started_at ? (serverNow() - d.playback_started_at) : 0);
     const pct = np.duration ? Math.min(100, elapsed/np.duration*100) : 0;
     document.getElementById('bar-fill').style.width = pct + '%';
     document.getElementById('t-elapsed').textContent = fmt(elapsed);
@@ -697,7 +833,7 @@ function showInviteLink(path){
   const link = `${location.origin}${path}`;
   document.getElementById('im-link').value = link;
   document.getElementById('im-link-row').style.display = 'flex';
-  document.getElementById('im-qr').src = `${API}/invite/qr?data=${encodeURIComponent(link)}`;
+  document.getElementById('im-qr').src = withKey(`${API}/invite/qr?data=${encodeURIComponent(link)}`);
   document.getElementById('im-qr-wrap').style.display = 'flex';
 }
 

@@ -114,10 +114,11 @@ stops things from getting *worse*, it doesn't reclaim anything already
 there).
 
 A background job checks every 6 hours and deletes the *oldest* files in
-`Jam/` until it's back under 5GB total, then removes the now-stale
-Navidrome library entries directly (a scan alone doesn't reliably prune
-an entry for a file that just vanished off disk — same lesson learned
-fixing Spotidrome's own library-maintenance jobs) and triggers a rescan.
+`Jam/` until it's back under 5GB total and triggers a full rescan, which
+marks the vanished files missing. (It used to delete their rows from
+`navidrome.db` with the `sqlite3` CLI — never do that: the CLI's SQLite
+computes expression-index keys differently from Navidrome's bundled one,
+which corrupted the database.)
 `Jam/` is a rolling window this way, not permanent storage — a track
 still played from the local download the moment it's requested either
 way, this only affects whether an *old* jam track is still sitting there
@@ -163,13 +164,41 @@ you revoke it from the same modal. Any link still listed under Active
 Links can be reopened (🔗) to bring its link/QR back up again, without
 needing to generate a new one.
 
-The Active Links list itself is scoped per browser (a random id kept in
-that browser's `localStorage`) — open the player page in a different
-browser, or a private/incognito window, and its Active Links starts
-empty, seeing none of another session's links and unable to revoke them
-either. The links *themselves* are still "whoever has the link" with no
-accounts — this scoping is just about which session's own management
-list shows what, not about restricting who can use a link once shared.
+Every host (the player page, LunaDrome) sees and can revoke every live
+link. A link is the key to the jam: the request page keeps its token and
+sends it on every call, and the API refuses guests without a live one
+(see **Internet access** below). Ending the jam revokes all links.
+
+## Internet access, host login and the speaker
+
+The jam is meant to be reachable from the internet, so access is split in
+three, enforced by one deny-by-default gate in `backend/app.py`:
+
+- **Public:** `/config`, `/invite/<token>` (the link itself) and cover art
+  of tracks in the queue.
+- **Guests:** search, request, vote, react — only with a live invite token
+  (`X-Jam-Invite` header). `JAM_REQUIRE_INVITE=0` turns this off for a
+  LAN-only setup.
+- **Host:** everything else (playback, streams, invites, moderation). The
+  player page asks for `JAM_HOST_PIN` once; apps like LunaDrome log in with
+  Navidrome credentials (`POST /host/login`, checked against Navidrome —
+  admins only, or the `JAM_HOST_USERS` allowlist). Either way you get a
+  host token (`X-Jam-Host-Token`, or `?key=` for audio URLs), valid 90 days.
+
+**One speaker at a time.** The jam lives on the server; a device only plays
+it. `POST /speaker/claim` makes a device the speaker ("Play here" — the
+player page's Start button does it), it heartbeats every 5s, and any other
+device that claims takes over (the old one is told on its next heartbeat
+and goes quiet). If the speaker goes silent for 20s — app closed, laptop
+asleep, phone lost signal — the jam **pauses where it is** instead of
+playing through the queue to nobody, and resumes at the same second when
+a device claims again. Guests can keep adding songs meanwhile. A pause
+someone pressed on purpose is never undone by a claim.
+
+`/queue/add-library` queues a track straight from the Navidrome library by
+song id (no download); `/jam/end` clears the queue, revokes all invites,
+drops the speaker and turns Auto DJ off. `/player/state` includes
+`server_time` so clients can correct for their own clock.
 
 ## Behind a reverse proxy
 
