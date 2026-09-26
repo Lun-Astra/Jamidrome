@@ -184,7 +184,7 @@ def _prune_expired_host_tokens():
 # The host PIN is short (it's typed on a TV), and the jam is on the internet: a
 # per-request sleep doesn't stop parallel guessing. So wrong PINs are counted
 # globally (across all clients) and PIN auth locks for everyone after too many.
-PIN_MAX_FAILURES = 10
+PIN_MAX_FAILURES = 3
 PIN_FAILURE_WINDOW_SEC = 600
 PIN_LOCKOUT_SEC = 600
 _pin_lock = threading.Lock()
@@ -212,16 +212,18 @@ def _pin_ok(pin):
 
 def _is_host():
     """Host = a valid host token (header, or ?key= for <audio src> which
-    can't send headers) or the shared PIN header the web player page uses."""
-    pin = request.headers.get("X-Jam-Host-Pin", "")
-    if pin and _pin_ok(pin)[0]:
-        return True
+    can't send headers) or the shared PIN header the web player page uses.
+    The token is checked first: the player page sends both, and a stale saved
+    PIN (after JAM_HOST_PIN changed) must not count toward the global lockout
+    on every request while its token is still valid."""
     token = request.headers.get("X-Jam-Host-Token", "") or request.args.get("key", "")
-    if not token:
-        return False
-    with state_lock:
-        info = (state.get("host_tokens") or {}).get(token)
-        return bool(info) and info.get("expires_at", 0) > time.time()
+    if token:
+        with state_lock:
+            info = (state.get("host_tokens") or {}).get(token)
+            if info and info.get("expires_at", 0) > time.time():
+                return True
+    pin = request.headers.get("X-Jam-Host-Pin", "")
+    return bool(pin) and _pin_ok(pin)[0]
 
 
 def _require_host():

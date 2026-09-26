@@ -180,10 +180,31 @@ three, enforced by one deny-by-default gate in `backend/app.py`:
   (`X-Jam-Invite` header). `JAM_REQUIRE_INVITE=0` turns this off for a
   LAN-only setup.
 - **Host:** everything else (playback, streams, invites, moderation). The
-  player page asks for `JAM_HOST_PIN` once; apps like LunaDrome log in with
+  player page asks for the host PIN once; apps like LunaDrome log in with
   Navidrome credentials (`POST /host/login`, checked against Navidrome —
   admins only, or the `JAM_HOST_USERS` allowlist). Either way you get a
   host token (`X-Jam-Host-Token`, or `?key=` for audio URLs), valid 90 days.
+
+### Host PIN
+
+The host PIN is set as `JAM_HOST_PIN` in the `.env` file next to
+`docker-compose.yml` (see `.env.example`). `.env` is gitignored, so the PIN
+never ends up in this repo. To change it, edit `.env` and restart the
+backend — no rebuild needed:
+
+```sh
+docker compose up -d jam-backend
+```
+
+The player page then asks for the new PIN once. Devices already logged in
+keep working on their host token until it expires.
+
+**Lockout:** 3 wrong PINs within 10 minutes — from any device, via
+`/host/login` or the `X-Jam-Host-Pin` header — lock PIN login for everyone
+for 10 minutes. The count is global rather than per client, so parallel
+guessing from the internet doesn't get around it. Existing host tokens and
+Navidrome logins keep working during a lockout; restarting the backend
+clears it.
 
 **One speaker at a time.** The jam lives on the server; a device only plays
 it. `POST /speaker/claim` makes a device the speaker ("Play here" — the
