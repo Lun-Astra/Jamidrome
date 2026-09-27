@@ -179,32 +179,35 @@ three, enforced by one deny-by-default gate in `backend/app.py`:
 - **Guests:** search, request, vote, react — only with a live invite token
   (`X-Jam-Invite` header). `JAM_REQUIRE_INVITE=0` turns this off for a
   LAN-only setup.
-- **Host:** everything else (playback, streams, invites, moderation). The
-  player page asks for the host PIN once; apps like LunaDrome log in with
-  Navidrome credentials (`POST /host/login`, checked against Navidrome —
-  admins only, or the `JAM_HOST_USERS` allowlist). Either way you get a
-  host token (`X-Jam-Host-Token`, or `?key=` for audio URLs), valid 90 days.
+- **Host:** everything else (playback, streams, invites, moderation) — a
+  logged-in browser or an API key (see below).
 
-### Host PIN
+### Host login & API keys
 
-The host PIN is set as `JAM_HOST_PIN` in the `.env` file next to
-`docker-compose.yml` (see `.env.example`). `.env` is gitignored, so the PIN
-never ends up in this repo. To change it, edit `.env` and restart the
-backend — no rebuild needed:
+Same model as SpotiDrome:
 
-```sh
-docker compose up -d jam-backend
-```
+- **Web player page:** log in with a Navidrome account that is an **admin**
+  (or listed in `JAM_HOST_USERS`), checked against Navidrome itself. The
+  browser gets an `HttpOnly`, `SameSite=Lax` session cookie (`Secure` behind
+  https) for 30 days; it also covers `<audio>`/`<img>` URLs. State-changing
+  requests from a logged-in browser must carry `X-Jam-Web: 1` (the player
+  page adds it) so another site can't make the browser act as host. Log out
+  from the Host panel. 10 failed logins within 10 minutes lock password login
+  for everyone for 10 minutes (global, so spreading guesses over many IPs
+  doesn't help); logged-in browsers and API keys keep working meanwhile.
+- **API keys (apps like LunaDrome):** create one in the player page's
+  **Host panel → API keys**. The key (`jdk_…`) is shown **once**; only its
+  SHA-256 hash is stored (`/data/api_keys.json`). Send it as
+  `Authorization: Bearer <key>` (or `X-API-Key: <key>`), or as `?key=` on
+  media URLs that can't send headers. A key has full host access except
+  managing keys, which always needs a browser login. Revoke it in the same
+  panel.
+- `GET /session` says who you are (`logged_in`, `via: session|api_key`) —
+  a handy connection test for an API key. `POST /session/login` /
+  `POST /session/logout` log a browser in and out.
 
-The player page then asks for the new PIN once. Devices already logged in
-keep working on their host token until it expires.
-
-**Lockout:** 3 wrong PINs within 10 minutes — from any device, via
-`/host/login` or the `X-Jam-Host-Pin` header — lock PIN login for everyone
-for 10 minutes. The count is global rather than per client, so parallel
-guessing from the internet doesn't get around it. Existing host tokens and
-Navidrome logins keep working during a lockout; restarting the backend
-clears it.
+There is no PIN any more (`JAM_HOST_PIN` is ignored), and the old
+`/host/login` host tokens were dropped.
 
 **One speaker at a time.** The jam lives on the server; a device only plays
 it. `POST /speaker/claim` makes a device the speaker ("Play here" — the

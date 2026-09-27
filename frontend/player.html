@@ -162,9 +162,15 @@ body::before{content:'';position:fixed;inset:0;
 .hm-item button.hm-ban:hover{color:#f59e0b}
 .hm-item button.hm-unban:hover{color:var(--sp)}
 .hm-empty{color:var(--text3);font-size:12px;padding:6px 2px}
-.hm-pin-gate{text-align:center;padding:20px 0}
-.hm-pin-gate input{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 10px;color:var(--text);font-size:13px;outline:none;width:160px;text-align:center;margin:10px 0}
-.hm-pin-gate .err{color:#f87171;font-size:12px;min-height:16px}
+.ov-input{display:block;margin:0 auto 8px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:15px;outline:none;width:240px;max-width:80vw;cursor:text}
+.hm-row{display:flex;gap:6px;align-items:center;margin-top:8px}
+.hm-btn{background:var(--bg3);color:var(--text);border:1px solid var(--border2);border-radius:8px;padding:7px 12px;font-size:12px;cursor:pointer;flex-shrink:0}
+.hm-btn:hover{border-color:var(--text3)}
+.hm-btn-primary{background:var(--sp);color:#06210f;border-color:var(--sp);font-weight:600}
+.hm-row input{flex:1;min-width:0;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:12px;outline:none}
+.hm-sub{color:var(--text3);font-size:11.5px;line-height:1.5}
+.hm-newkey{display:none;margin-top:8px;padding:10px;border:1px solid rgba(30,215,96,.3);border-radius:8px;background:rgba(30,215,96,.06);font-size:12px}
+.hm-newkey code{display:block;margin:6px 0;overflow-wrap:anywhere;color:var(--sp)}
 </style>
 </head>
 <body>
@@ -174,13 +180,13 @@ body::before{content:'';position:fixed;inset:0;
     <div class="sub">Click anywhere to start the jam</div>
     <button class="btn" onclick="startJam()">▶ Start</button>
   </div>
-  <div id="ov-login" style="display:none;text-align:center">
-    <div class="sub">Enter the host PIN to play the jam on this screen</div>
-    <input id="ov-pin" type="password" inputmode="numeric" placeholder="PIN" autocomplete="off"
-      style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:15px;outline:none;width:180px;text-align:center;margin:14px 0 6px">
+  <form id="ov-login" style="display:none;text-align:center" onsubmit="event.preventDefault();hostLogin()">
+    <div class="sub">Log in with your Navidrome admin account to play the jam on this screen</div>
+    <input id="ov-user" class="ov-input" placeholder="Username" autocomplete="username" style="margin-top:14px">
+    <input id="ov-pass" class="ov-input" type="password" placeholder="Password" autocomplete="current-password">
     <div id="ov-err" style="color:#f87171;font-size:12px;min-height:16px;margin-bottom:10px"></div>
-    <button class="btn" onclick="hostLogin()">Unlock</button>
-  </div>
+    <button class="btn" type="submit">Log in</button>
+  </form>
 </div>
 
 <!-- Only one device plays the jam at a time (LunaDrome, another browser…).
@@ -234,17 +240,25 @@ body::before{content:'';position:fixed;inset:0;
 <div id="host-modal">
   <div class="hm-card">
     <div class="hm-hd"><h3>Host Controls</h3><button class="hm-close" onclick="closeHost()">✕</button></div>
-    <div id="hm-pin-gate" class="hm-pin-gate">
-      <div>Enter the host PIN (set as <code>JAM_HOST_PIN</code> in <code>.env</code>)</div>
-      <input id="hm-pin-input" type="password" inputmode="numeric" placeholder="PIN" autocomplete="off">
-      <div class="err" id="hm-pin-err"></div>
-      <button class="btn" onclick="submitHostPin()">Unlock</button>
-    </div>
-    <div id="hm-body" style="display:none">
+    <div id="hm-body">
       <div class="hm-sec-title">Queue</div>
       <div class="hm-list" id="hm-queue-list"><div class="hm-empty">Loading…</div></div>
       <div class="hm-sec-title">Banned</div>
       <div class="hm-list" id="hm-banned-list"><div class="hm-empty">Nobody's banned</div></div>
+      <div class="hm-sec-title">API keys</div>
+      <div class="hm-sub">For apps like LunaDrome (full host access). Sent as <code>Authorization: Bearer &lt;key&gt;</code>; shown once when created.</div>
+      <div class="hm-list" id="hm-keys-list" style="margin-top:8px"><div class="hm-empty">Loading…</div></div>
+      <div class="hm-newkey" id="hm-newkey">Copy this key now — it won't be shown again:<code id="hm-newkey-value"></code>
+        <button class="hm-btn" onclick="copyNewKey(this)">Copy</button></div>
+      <div class="hm-row">
+        <input id="hm-key-name" placeholder="Key name, e.g. LunaDrome on my PC" maxlength="60">
+        <button class="hm-btn hm-btn-primary" onclick="createApiKey()">+ Create</button>
+      </div>
+      <div class="hm-sec-title">Account</div>
+      <div class="hm-row" style="justify-content:space-between">
+        <div class="hm-sub">Logged in as <b id="hm-user">…</b></div>
+        <button class="hm-btn" onclick="hostLogout()">Log out</button>
+      </div>
     </div>
   </div>
 </div>
@@ -288,57 +302,68 @@ const SESSION_HEADERS = {'X-Jam-Session': SESSION_ID};
 
 // ── Host auth ────────────────────────────────────────────────────────────
 // Every player route is host-only now that the jam is reachable from the
-// internet. The PIN is exchanged once for a host token (localStorage), and
-// every /api call gets it attached here instead of at each fetch site.
-let HOST_TOKEN = localStorage.getItem('jam_host_token') || '';
+// internet. Logging in with a Navidrome admin account gives this browser a
+// session cookie (HttpOnly - the page never sees it), which the browser also
+// sends for <audio>/<img>. Every /api call gets the X-Jam-Web header the
+// backend requires for cookie-authenticated changes (CSRF guard).
+let HOST_USER = '';   // set once /session says we're logged in
 const _fetch = window.fetch.bind(window);
 window.fetch = (url, opts = {}) => {
   const isApi = typeof url === 'string' && url.startsWith(API);
-  if(isApi && HOST_TOKEN){
-    opts = {...opts, headers: {...(opts.headers || {}), 'X-Jam-Host-Token': HOST_TOKEN}};
+  if(isApi){
+    opts = {...opts, headers: {...(opts.headers || {}), 'X-Jam-Web': '1'}};
   }
   return _fetch(url, opts).then(r => {
-    if(isApi && r.status === 401 && !url.includes('/host/login')) onHostAuthLost();
+    if(isApi && r.status === 401 && !url.includes('/session')) onHostAuthLost();
     return r;
   });
 };
-// <audio>/<img> can't send headers — the token rides along as ?key=.
-function withKey(u){ return u ? `${u}${u.includes('?') ? '&' : '?'}key=${encodeURIComponent(HOST_TOKEN)}` : u; }
+// Media URLs need nothing extra now: the session cookie rides along.
+function withKey(u){ return u; }
 
 function showLoginGate(){
   document.getElementById('overlay').style.display = 'flex';
   document.getElementById('ov-start').style.display = 'none';
   document.getElementById('ov-login').style.display = 'block';
-  setTimeout(() => document.getElementById('ov-pin').focus(), 50);
+  setTimeout(() => document.getElementById('ov-user').focus(), 50);
 }
 function onHostAuthLost(){
-  if(!HOST_TOKEN) return;
-  HOST_TOKEN = '';
-  localStorage.removeItem('jam_host_token');
+  if(!HOST_USER) return;
+  HOST_USER = '';
   isSpeaker = false;
   audio.pause();
+  closeHost();
   showLoginGate();
 }
 async function hostLogin(){
-  const pin = document.getElementById('ov-pin').value.trim();
   const err = document.getElementById('ov-err');
   err.textContent = '';
   try{
-    const r = await fetch(`${API}/host/login`, {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({pin, label: `Web player (${location.hostname})`})});
-    const d = await r.json();
+    const r = await fetch(`${API}/session/login`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username: document.getElementById('ov-user').value.trim(),
+                            password: document.getElementById('ov-pass').value})});
+    const d = await r.json().catch(() => ({}));
     if(!r.ok){ err.textContent = d.error || 'Login failed'; return; }
-    HOST_TOKEN = d.token;
-    localStorage.setItem('jam_host_token', HOST_TOKEN);
-    // Also unlocks the Host panel without asking for the PIN again.
-    localStorage.setItem('jam_host_pin', pin);
-    hostPin = pin;
+    HOST_USER = d.user || '';
+    document.getElementById('ov-pass').value = '';
     document.getElementById('ov-login').style.display = 'none';
     document.getElementById('ov-start').style.display = 'contents';
   }catch(e){ err.textContent = 'Could not reach the jam server'; }
 }
-document.getElementById('ov-pin').addEventListener('keydown', e => { if(e.key === 'Enter') hostLogin(); });
-if(!HOST_TOKEN) showLoginGate();
+async function hostLogout(){
+  // Hand the jam back first - after logging out this page can't release it.
+  if(isSpeaker){
+    try{ await fetch(`${API}/speaker/release`, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({device_id: DEVICE_ID})}); }catch(e){}
+  }
+  try{ await fetch(`${API}/session/logout`, {method:'POST'}); }catch(e){}
+  HOST_USER = 'x';   // so onHostAuthLost runs its full reset
+  onHostAuthLost();
+}
+fetch(`${API}/session`).then(r => r.json()).then(d => {
+  if(d.logged_in) HOST_USER = d.user || d.key_name || 'host';
+  else showLoginGate();
+}).catch(() => showLoginGate());
 
 // ── Speaker (one device plays the jam at a time) ─────────────────────────
 // Claiming makes this page the speaker; a heartbeat every 5s keeps it. If
@@ -917,57 +942,29 @@ async function pollReactions(){
 pollReactions();
 
 // ── Host panel ────────────────────────────────────────────────────────────
-// The PIN is the entire auth model (see _require_host_pin in the backend) —
-// stored in localStorage once entered correctly so it isn't re-typed every
-// time, same trust level as SESSION_ID above (this browser, not this
-// person). A wrong/missing PIN just re-shows the gate with an error rather
-// than ever silently failing open.
-let hostPin = localStorage.getItem('jam_host_pin') || '';
+// Same login as the rest of the page (the session cookie) - no extra gate.
 let hostPollTimer = null;
 
-function hostHeaders(){ return {'Content-Type':'application/json', 'X-Jam-Host-Pin': hostPin}; }
+function hostHeaders(){ return {'Content-Type':'application/json'}; }
 
 function openHost(){
   document.getElementById('host-modal').classList.add('show');
-  document.getElementById('hm-pin-err').textContent = '';
-  if(hostPin){ showHostBody(); } else { showHostGate(); }
+  document.getElementById('hm-user').textContent = HOST_USER || '…';
+  document.getElementById('hm-newkey').style.display = 'none';
+  refreshHostPanel();
+  loadApiKeys();
 }
 function closeHost(){
   document.getElementById('host-modal').classList.remove('show');
   clearTimeout(hostPollTimer);
 }
-function showHostGate(){
-  document.getElementById('hm-pin-gate').style.display = 'block';
-  document.getElementById('hm-body').style.display = 'none';
-  document.getElementById('hm-pin-input').value = '';
-  document.getElementById('hm-pin-input').focus();
-}
-function showHostBody(){
-  document.getElementById('hm-pin-gate').style.display = 'none';
-  document.getElementById('hm-body').style.display = 'block';
-  refreshHostPanel();
-}
-function submitHostPin(){
-  hostPin = document.getElementById('hm-pin-input').value.trim();
-  localStorage.setItem('jam_host_pin', hostPin);
-  showHostBody();
-}
-document.getElementById('hm-pin-input').addEventListener('keydown', e => { if(e.key === 'Enter') submitHostPin(); });
 
 async function refreshHostPanel(){
   clearTimeout(hostPollTimer);
   try{
     const r = await fetch(`${API}/host/queue`, {headers: hostHeaders()});
     const d = await r.json();
-    if(!r.ok){
-      // Wrong/unconfigured PIN — drop the stored one and re-show the gate
-      // with the actual reason, rather than silently spinning forever.
-      localStorage.removeItem('jam_host_pin');
-      hostPin = '';
-      showHostGate();
-      document.getElementById('hm-pin-err').textContent = d.error || 'Could not load host controls';
-      return;
-    }
+    if(!r.ok) return;   // a 401 already sent the page back to the login screen
     const items = [d.now_playing, ...(d.queue || [])].filter(Boolean);
     const list = document.getElementById('hm-queue-list');
     list.innerHTML = items.length ? items.map(it => `
@@ -1005,6 +1002,50 @@ async function hostUnban(sessionId){
   refreshHostPanel();
 }
 function escA(s){return String(s).replace(/'/g,"\\'");}
+
+// API keys for apps (LunaDrome). Creating/revoking needs this browser's
+// login - a key itself can't manage keys.
+function fmtWhen(ts){ return ts ? new Date(ts * 1000).toLocaleString() : 'never'; }
+async function loadApiKeys(){
+  const el = document.getElementById('hm-keys-list');
+  try{
+    const r = await fetch(`${API}/api-keys`), keys = await r.json();
+    if(!r.ok){ el.innerHTML = `<div class="hm-empty">${esc(keys.error || 'Could not load keys')}</div>`; return; }
+    el.innerHTML = keys.length ? keys.map(k => `
+      <div class="hm-item">
+        <div class="info">
+          <div class="t">${esc(k.name)}</div>
+          <div class="s">${esc(k.prefix)}… · created ${fmtWhen(k.created_at)} · last used ${fmtWhen(k.last_used_at)}</div>
+        </div>
+        <button class="hm-btn" onclick="revokeApiKey('${escA(k.id)}', this)">Revoke</button>
+      </div>`).join('') : '<div class="hm-empty">No API keys yet</div>';
+  }catch(e){ el.innerHTML = '<div class="hm-empty">Could not load keys</div>'; }
+}
+async function createApiKey(){
+  const input = document.getElementById('hm-key-name'), name = input.value.trim();
+  if(!name){ input.focus(); return; }
+  const r = await fetch(`${API}/api-keys`, {method:'POST', headers: hostHeaders(), body: JSON.stringify({name})});
+  const d = await r.json().catch(() => ({}));
+  if(!r.ok){ input.value = ''; input.placeholder = d.error || 'Could not create key'; return; }
+  input.value = '';
+  document.getElementById('hm-newkey-value').textContent = d.key;
+  document.getElementById('hm-newkey').style.display = 'block';
+  loadApiKeys();
+}
+function copyNewKey(btn){
+  navigator.clipboard.writeText(document.getElementById('hm-newkey-value').textContent)
+    .then(() => { btn.textContent = 'Copied'; setTimeout(() => btn.textContent = 'Copy', 1500); });
+}
+// Arm-then-confirm instead of confirm(): no native dialogs to get suppressed.
+async function revokeApiKey(id, btn){
+  if(!btn.dataset.armed){
+    btn.dataset.armed = '1'; btn.textContent = 'Click again';
+    setTimeout(() => { delete btn.dataset.armed; btn.textContent = 'Revoke'; }, 4000);
+    return;
+  }
+  await fetch(`${API}/api-keys/${encodeURIComponent(id)}`, {method:'DELETE'});
+  loadApiKeys();
+}
 
 // ── Visualizer ───────────────────────────────────────────────────────────
 // createMediaElementSource irreversibly reroutes the <audio> element's

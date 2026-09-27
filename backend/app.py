@@ -1,7 +1,7 @@
-import difflib, glob, io, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, uuid
+import difflib, glob, hashlib, io, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 import requests as http
-from flask import Flask, jsonify, request, send_file, abort, redirect, Response
+from flask import Flask, jsonify, request, send_file, abort, redirect, Response, g
 from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -69,25 +69,15 @@ REQUEST_PAGE_URL     = os.environ.get("REQUEST_PAGE_URL", "").rstrip("/")
 MIN_INVITE_TTL_SEC   = 60
 MAX_INVITE_TTL_SEC   = 7 * 24 * 3600
 
-# This app has no accounts of any kind otherwise — a single shared PIN, set
-# once via .env and known only to whoever's actually running the jam, is the
-# entire moderation boundary for the /host/* routes below. Deliberately not
-# more than that: real accounts would be pure overhead for a living-room
-# party app that already treats "has the QR link" as "trusted enough to
-# request/vote."
-JAM_HOST_PIN = os.environ.get("JAM_HOST_PIN", "")
-
 # Once the jam is reachable from the internet, "can reach the page" no longer
 # means "was invited" — every guest route requires a live invite token (or
 # host auth). Set JAM_REQUIRE_INVITE=0 to go back to the old open-LAN mode.
 JAM_REQUIRE_INVITE = os.environ.get("JAM_REQUIRE_INVITE", "1").strip().lower() not in ("0", "false", "no", "")
 
-# Host login for apps (LunaDrome): Navidrome credentials, verified against
-# Navidrome itself, exchanged for a long-lived random host token. Empty
-# JAM_HOST_USERS = any Navidrome *admin* may host; otherwise a comma-separated
-# allowlist of usernames.
+# Who may log in as host (web player page): Navidrome credentials, verified
+# against Navidrome itself. Empty JAM_HOST_USERS = any Navidrome *admin*;
+# otherwise a comma-separated allowlist of usernames. Apps use API keys.
 JAM_HOST_USERS = {u.strip().lower() for u in os.environ.get("JAM_HOST_USERS", "").split(",") if u.strip()}
-HOST_TOKEN_TTL_SEC = 90 * 24 * 3600
 
 # Only one device plays the jam at a time (the "speaker"). It heartbeats
 # every few seconds; if it goes quiet for this long, the jam pauses right
@@ -112,8 +102,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # banned_sessions: session_ids the host has kicked — checked wherever a
 #          session_id could otherwise request/upvote/skip-vote; doesn't
 #          revoke anything already queued, just blocks new interactions.
-# host_tokens: token -> {user, label, created_at, expires_at} — minted by
-#          /host/login for apps that authenticated with Navidrome creds or the PIN.
+# (Host logins and API keys live in their own files - see SESSIONS_FILE.)
 # speaker: {device_id, name, last_seen} of the one device currently playing
 #          the jam, or None — see SPEAKER_TIMEOUT_SEC.
 # pause_reason: "host" (someone pressed pause) or "no_speaker" (auto-pause);
@@ -121,7 +110,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 state_lock = threading.Lock()
 state = {"queue": [], "history": [], "now_playing_id": None, "playback_started_at": None, "invites": {},
          "paused": False, "pause_started_at": None, "autoplay_enabled": True, "banned_sessions": [],
-         "host_tokens": {}, "speaker": None, "pause_reason": None}
+         "speaker": None, "pause_reason": None}
 
 # Live emoji reactions fired from the request page and animated over the
 # player page — deliberately kept out of `state`/state.json entirely rather
@@ -155,7 +144,9 @@ def load_state():
     state["pause_reason"] = None
     # Whatever device was the speaker has to claim again after a restart.
     state["speaker"] = None
-    state.setdefault("host_tokens", {})
+    # Host tokens (PIN / old /host/login) were replaced by sessions + API keys;
+    # drop any still saved so none of them keeps working.
+    state.pop("host_tokens", None)
     for item in state["queue"]:
         if item.get("status") == "playing":
             item["status"] = "ready"
@@ -173,69 +164,122 @@ def find_item(item_id):
     return None
 
 
-def _prune_expired_host_tokens():
-    """Must be called with state_lock held."""
+# ─── Host auth: web login sessions + API keys (same model as SpotiDrome) ─────
+# A host is either a browser logged in with a Navidrome *admin* account (or a
+# JAM_HOST_USERS name) - a session cookie - or an app like LunaDrome with an
+# API key made in the player page's Host panel. Session tokens and keys are
+# stored as SHA-256 hashes only, in their own files (not state.json).
+SESSIONS_FILE   = os.path.join(DATA_DIR, "web_sessions.json")
+API_KEYS_FILE   = os.path.join(DATA_DIR, "api_keys.json")
+SESSION_COOKIE  = "jam_session"
+SESSION_TTL_SEC = 30 * 24 * 3600
+LAST_SEEN_WRITE_SEC = 300  # don't rewrite the store on every request
+
+# Password guessing is limited globally (so spreading guesses over many IPs
+# doesn't help): 10 failed logins within 10 minutes lock password login for
+# 10 minutes. Logged-in browsers and API keys keep working meanwhile.
+LOGIN_MAX_FAILURES = 10
+LOGIN_FAILURE_WINDOW_SEC = 600
+LOGIN_LOCKOUT_SEC = 600
+
+_auth_lock = threading.Lock()
+_login_failures = []
+_login_locked_until = 0.0
+
+
+def _hash_secret(secret):
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+def _load_auth_store(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_auth_store(path, data):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def _request_is_https():
+    return request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+
+def _session_from_request():
+    """(token_hash, session) for a live session cookie, else (None, None)."""
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not token:
+        return None, None
+    h = _hash_secret(token)
     now = time.time()
-    tokens = state.setdefault("host_tokens", {})
-    for t in [t for t, v in tokens.items() if v.get("expires_at", 0) <= now]:
-        del tokens[t]
+    with _auth_lock:
+        sessions = _load_auth_store(SESSIONS_FILE)
+        s = sessions.get(h)
+        if not s or s.get("expires_at", 0) <= now:
+            return None, None
+        if now - (s.get("last_seen_at") or 0) > LAST_SEEN_WRITE_SEC:
+            s["last_seen_at"] = now
+            _save_auth_store(SESSIONS_FILE, sessions)
+    return h, s
 
 
-# The host PIN is short (it's typed on a TV), and the jam is on the internet: a
-# per-request sleep doesn't stop parallel guessing. So wrong PINs are counted
-# globally (across all clients) and PIN auth locks for everyone after too many.
-PIN_MAX_FAILURES = 3
-PIN_FAILURE_WINDOW_SEC = 600
-PIN_LOCKOUT_SEC = 600
-_pin_lock = threading.Lock()
-_pin_failures = []        # timestamps of recent wrong PINs
-_pin_locked_until = 0.0
-
-
-def _pin_ok(pin):
-    """Checks a host PIN with the global lockout. Returns (ok, error)."""
-    global _pin_locked_until
+def _api_key_from_request():
+    """The key record for a valid API key, else None. Header for API calls;
+    ?key= for media URLs (<audio src>, images) that can't send headers."""
+    auth = request.headers.get("Authorization", "")
+    key = (auth[7:].strip() if auth[:7].lower() == "bearer " else "") \
+        or request.headers.get("X-API-Key", "").strip() or request.args.get("key", "").strip()
+    if not key:
+        return None
+    h = _hash_secret(key)
     now = time.time()
-    with _pin_lock:
-        if now < _pin_locked_until:
-            return False, "Too many wrong PINs - PIN login is locked for a few minutes"
-        if JAM_HOST_PIN and pin and secrets.compare_digest(pin, JAM_HOST_PIN):
-            return True, None
-        _pin_failures[:] = [t for t in _pin_failures if now - t < PIN_FAILURE_WINDOW_SEC] + [now]
-        if len(_pin_failures) >= PIN_MAX_FAILURES:
-            _pin_locked_until = now + PIN_LOCKOUT_SEC
-            _pin_failures.clear()
-            print(f"[jam] {PIN_MAX_FAILURES} wrong host PINs in {PIN_FAILURE_WINDOW_SEC}s - "
-                  f"PIN login locked for {PIN_LOCKOUT_SEC}s", flush=True)
-        return False, "Wrong PIN"
+    with _auth_lock:
+        keys = _load_auth_store(API_KEYS_FILE)
+        for k in keys.values():
+            if secrets.compare_digest(k.get("hash", ""), h):
+                if now - (k.get("last_used_at") or 0) > LAST_SEEN_WRITE_SEC:
+                    k["last_used_at"] = now
+                    _save_auth_store(API_KEYS_FILE, keys)
+                return k
+    return None
+
+
+def _host_identity():
+    """Who the host is for this request (cached per request), or None."""
+    if "jam_host" not in g:
+        _h, s = _session_from_request()
+        if s:
+            g.jam_host = {"via": "session", "user": s["user"]}
+        else:
+            k = _api_key_from_request()
+            g.jam_host = {"via": "api_key", "key_id": k["id"], "key_name": k["name"]} if k else None
+    return g.jam_host
 
 
 def _is_host():
-    """Host = a valid host token (header, or ?key= for <audio src> which
-    can't send headers) or the shared PIN header the web player page uses.
-    The token is checked first: the player page sends both, and a stale saved
-    PIN (after JAM_HOST_PIN changed) must not count toward the global lockout
-    on every request while its token is still valid."""
-    token = request.headers.get("X-Jam-Host-Token", "") or request.args.get("key", "")
-    if token:
-        with state_lock:
-            info = (state.get("host_tokens") or {}).get(token)
-            if info and info.get("expires_at", 0) > time.time():
-                return True
-    pin = request.headers.get("X-Jam-Host-Pin", "")
-    return bool(pin) and _pin_ok(pin)[0]
+    return _host_identity() is not None
 
 
 def _require_host():
     """Gate for every host-only route. Returns a Flask response to abort
     the request with, or None to let it proceed."""
-    if _is_host():
-        return None
-    return jsonify({"error": "Host login required"}), 401
+    who = _host_identity()
+    if not who:
+        return jsonify({"error": "Host login required", "login_required": True}), 401
+    # A logged-in browser sends its cookie on any request to this site, so a
+    # state-changing request must also carry the header our own pages add -
+    # another page can't make a browser send that without a CORS preflight.
+    if who["via"] == "session" and request.method not in ("GET", "HEAD") \
+            and request.headers.get("X-Jam-Web") != "1":
+        return jsonify({"error": "Missing X-Jam-Web header"}), 403
+    return None
 
-
-# Kept for the existing /host/* moderation routes below.
-_require_host_pin = _require_host
 
 
 def _invite_token_from_request():
@@ -1464,10 +1508,13 @@ def _request_page_url():
 # guest is host-only, so a route added later can't accidentally ship open to
 # the internet.
 
-PUBLIC_ENDPOINTS = {"route_config", "route_invite_consume", "route_cover", "route_host_login", "static"}
+PUBLIC_ENDPOINTS = {"route_config", "route_invite_consume", "route_cover", "route_session_get",
+                    "route_session_login", "route_session_logout", "static"}
 GUEST_ENDPOINTS = {"route_search", "route_queue_get", "route_queue_add", "route_queue_add_library",
                    "route_queue_upvote", "route_vote_skip", "route_requeue", "route_queue_remove",
                    "route_reaction_send", "route_invite_check"}
+# Managing API keys always needs a real (browser) login - a key can't mint keys.
+SESSION_ONLY_ENDPOINTS = {"route_api_keys_list", "route_api_keys_create", "route_api_keys_revoke"}
 
 
 @app.before_request
@@ -1478,7 +1525,12 @@ def _access_gate():
         return None
     if request.endpoint in GUEST_ENDPOINTS:
         return _require_guest()
-    return _require_host()
+    err = _require_host()
+    if err:
+        return err
+    if request.endpoint in SESSION_ONLY_ENDPOINTS and _host_identity()["via"] != "session":
+        return jsonify({"error": "Managing API keys needs a web login, not an API key"}), 403
+    return None
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -1486,7 +1538,7 @@ def _access_gate():
 @app.route("/config")
 def route_config():
     return jsonify({"request_page_url": REQUEST_PAGE_URL or None, "invite_required": JAM_REQUIRE_INVITE,
-                    "host_pin_enabled": bool(JAM_HOST_PIN)})
+                    "host_login": "navidrome"})
 
 
 @app.route("/invite/check")
@@ -1497,43 +1549,101 @@ def route_invite_check():
 
 # ─── Host login & speaker ────────────────────────────────────────────────────
 
-@app.route("/host/login", methods=["POST"])
-def route_host_login():
-    """Exchanges Navidrome credentials ({username, password} or Subsonic
-    {username, token, salt}) or the host PIN ({pin}) for a host token."""
+@app.route("/session", methods=["GET"])
+def route_session_get():
+    """Who am I: a logged-in browser, an API key (a handy connection test for
+    apps), or nobody."""
+    who = _host_identity()
+    return jsonify({"logged_in": True, **who} if who else {"logged_in": False})
+
+
+@app.route("/session/login", methods=["POST"])
+def route_session_login():
+    """Navidrome username + password -> a 30-day session cookie for this browser."""
+    global _login_locked_until
     data = request.json or {}
     username = (data.get("username") or "").strip()
-    pin = (data.get("pin") or "").strip()
-    if pin:
-        ok, err = _pin_ok(pin)
-        if not ok:
-            time.sleep(1)
-            return jsonify({"error": err}), 403
-        username = "pin"
-    elif username:
-        ok, err = _verify_navidrome_user(username, password=data.get("password"),
-                                         token=data.get("token"), salt=data.get("salt"))
-        if not ok:
-            time.sleep(1)
-            return jsonify({"error": err}), 403
-    else:
-        return jsonify({"error": "username or pin required"}), 400
-    token = secrets.token_urlsafe(24)
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+    with _auth_lock:
+        if time.time() < _login_locked_until:
+            return jsonify({"error": "Too many failed logins - try again in a few minutes"}), 429
+    ok, err = _verify_navidrome_user(username, password=password)
+    if not ok:
+        now = time.time()
+        with _auth_lock:
+            _login_failures[:] = [t for t in _login_failures if now - t < LOGIN_FAILURE_WINDOW_SEC] + [now]
+            if len(_login_failures) >= LOGIN_MAX_FAILURES:
+                _login_locked_until = now + LOGIN_LOCKOUT_SEC
+                _login_failures.clear()
+                print(f"[jam] {LOGIN_MAX_FAILURES} failed logins in {LOGIN_FAILURE_WINDOW_SEC}s - "
+                      f"password login locked for {LOGIN_LOCKOUT_SEC}s", flush=True)
+        time.sleep(1)
+        return jsonify({"error": err}), 403
+    token = secrets.token_urlsafe(32)
     now = time.time()
-    with state_lock:
-        _prune_expired_host_tokens()
-        state["host_tokens"][token] = {"user": username, "label": (data.get("label") or "")[:60],
-                                       "created_at": now, "expires_at": now + HOST_TOKEN_TTL_SEC}
-        save_state()
-    return jsonify({"token": token, "user": username, "expires_at": now + HOST_TOKEN_TTL_SEC})
+    with _auth_lock:
+        sessions = {h: s for h, s in _load_auth_store(SESSIONS_FILE).items() if s.get("expires_at", 0) > now}
+        sessions[_hash_secret(token)] = {"user": username, "created_at": now, "last_seen_at": now,
+                                         "expires_at": now + SESSION_TTL_SEC}
+        _save_auth_store(SESSIONS_FILE, sessions)
+    resp = jsonify({"logged_in": True, "user": username})
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_SEC, httponly=True,
+                    secure=_request_is_https(), samesite="Lax", path="/")
+    return resp
 
 
-@app.route("/host/logout", methods=["POST"])
-def route_host_logout():
-    token = request.headers.get("X-Jam-Host-Token", "")
-    with state_lock:
-        state["host_tokens"].pop(token, None)
-        save_state()
+@app.route("/session/logout", methods=["POST"])
+def route_session_logout():
+    h, _s = _session_from_request()
+    if h:
+        with _auth_lock:
+            sessions = _load_auth_store(SESSIONS_FILE)
+            sessions.pop(h, None)
+            _save_auth_store(SESSIONS_FILE, sessions)
+    resp = jsonify({"logged_in": False})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+
+def _public_key_record(k):
+    return {f: k.get(f) for f in ("id", "name", "prefix", "created_at", "created_by", "last_used_at")}
+
+
+@app.route("/api-keys", methods=["GET"])
+def route_api_keys_list():
+    keys = _load_auth_store(API_KEYS_FILE)
+    return jsonify(sorted((_public_key_record(k) for k in keys.values()),
+                          key=lambda k: k.get("created_at") or 0, reverse=True))
+
+
+@app.route("/api-keys", methods=["POST"])
+def route_api_keys_create():
+    """A new API key for an app (LunaDrome): full host access, shown once."""
+    name = ((request.json or {}).get("name") or "").strip()[:60]
+    if not name:
+        return jsonify({"error": "Give the key a name (e.g. \"LunaDrome on my PC\")"}), 400
+    key = "jdk_" + secrets.token_urlsafe(32)
+    now = time.time()
+    record = {"id": uuid.uuid4().hex[:12], "name": name, "prefix": key[:10], "hash": _hash_secret(key),
+              "created_at": now, "created_by": _host_identity()["user"], "last_used_at": None}
+    with _auth_lock:
+        keys = _load_auth_store(API_KEYS_FILE)
+        keys[record["id"]] = record
+        _save_auth_store(API_KEYS_FILE, keys)
+    # The only time the full key is ever returned - only its hash is stored.
+    return jsonify({**_public_key_record(record), "key": key}), 201
+
+
+@app.route("/api-keys/<key_id>", methods=["DELETE"])
+def route_api_keys_revoke(key_id):
+    with _auth_lock:
+        keys = _load_auth_store(API_KEYS_FILE)
+        if key_id not in keys:
+            return jsonify({"error": "No such key"}), 404
+        keys.pop(key_id)
+        _save_auth_store(API_KEYS_FILE, keys)
     return jsonify({"ok": True})
 
 
@@ -2111,15 +2221,13 @@ def route_invite_consume(token):
 
 
 # ─── Host controls ───────────────────────────────────────────────────────────
-# The only moderation surface in the app — see _require_host_pin above for
-# why a single shared PIN is the whole auth model here. Meant to be reached
-# from a hidden panel on the player page only (never surfaced on the public
-# request page), since whoever's standing at the actual display is who
-# should hold the PIN.
+# The moderation surface: the Host panel on the player page (never surfaced
+# on the public request page). Host-only like every non-guest route - a
+# logged-in host browser or an API key (see _require_host).
 
 @app.route("/host/queue")
 def route_host_queue():
-    err = _require_host_pin()
+    err = _require_host()
     if err:
         return err
     with state_lock:
@@ -2149,7 +2257,7 @@ def route_host_delete(item_id):
     flags a downloading one for the worker loop to discard once it finishes
     instead of promoting/syncing it (see download_worker_loop); skips the
     currently-playing item to whatever's next, same as a passed skip vote."""
-    err = _require_host_pin()
+    err = _require_host()
     if err:
         return err
     do_advance = False
@@ -2171,7 +2279,7 @@ def route_host_delete(item_id):
 
 @app.route("/host/ban", methods=["POST"])
 def route_host_ban():
-    err = _require_host_pin()
+    err = _require_host()
     if err:
         return err
     session_id = ((request.json or {}).get("session_id") or "").strip()
@@ -2187,7 +2295,7 @@ def route_host_ban():
 
 @app.route("/host/unban", methods=["POST"])
 def route_host_unban():
-    err = _require_host_pin()
+    err = _require_host()
     if err:
         return err
     session_id = ((request.json or {}).get("session_id") or "").strip()
