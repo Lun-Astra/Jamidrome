@@ -1141,8 +1141,8 @@ function computeBarBins(){
 // under "gravity" once it's ahead of it) and a fading reflection below the
 // baseline are the two signature touches kept
 // from the classic hi-fi/audioMotion-style spectrum analyzer look — just
-// traced as one continuous curve now instead of per-band bars/caps, per
-// Luna's call: a solid line reads as a waveform, not a bar chart.
+// traced as one continuous curve now instead of per-band bars/caps, since
+// a solid line reads as a waveform, not a bar chart.
 let peaks = null;
 let smoothHeights = null; // low-passed version of heights[] the curve is actually drawn from
 
@@ -1180,7 +1180,7 @@ function drawVisualizer(){
   // downward reflection), so a lower gamma means bigger swings both above
   // and below the baseline at quiet volumes, not just a taller ceiling.
   // 0.4 (10% volume -> ~40% of full-scale motion) still read as too flat
-  // per Luna's follow-up, so dropped further to 0.25 (10% volume -> ~56%,
+  // in testing, so dropped further to 0.25 (10% volume -> ~56%,
   // 50% volume -> ~84%).
   const VIZ_VOLUME_GAMMA = 0.25;
   const volScale = audio.muted ? 0 : Math.pow(audio.volume, VIZ_VOLUME_GAMMA);
@@ -1215,7 +1215,7 @@ function drawVisualizer(){
     smoothHeights[j] += (heights[j] - smoothHeights[j]) * VIZ_SMOOTHING;
     // The peak-hold line used to chase raw heights[] on the rise (instant
     // snap up on every transient, only the fall was eased under gravity) —
-    // Luna confirmed after the main curve got smoothed that this snap was
+    // testing showed, after the main curve got smoothed, that this snap was
     // the actual thing still reading as fast. Chasing smoothHeights instead
     // means it rises at the same eased rate as the curve it's holding above,
     // and only the gravity-fall stays instant-by-comparison/slow as before.

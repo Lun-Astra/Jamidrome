@@ -258,13 +258,34 @@ reach Spotidrome's `bgutil-pot` container instead of running a second one —
 **Spotidrome needs to be up first** (`docker compose up -d` in `../spotidrome`)
 before this one is started, since that network has to already exist.
 
+Start it with the prebuilt images (or build them yourself from this checkout
+with `docker compose up -d --build`):
+
 ```bash
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 Then open the player URL on the display/speaker device and the request URL
 on your phone — either the reverse-proxied hostnames (see below) or
 `http://<host>:9999` / `http://<host>:9998` directly.
+
+## Updating
+
+Prebuilt images for `linux/amd64` and `linux/arm64` are published to GitHub
+Container Registry by `.github/workflows/docker-images.yml`:
+`ghcr.io/lun-astra/jamidrome-backend` and `ghcr.io/lun-astra/jamidrome-frontend`.
+`:latest` is rebuilt on every push to `master` **and every week** from
+scratch (base-image security fixes, newest yt-dlp / ytmusicapi); release tags
+(`v1.2.3`) also get `:1.2.3` / `:1.2` if you'd rather pin.
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Settings and state stay where they are (`.env`, `./data/`, `~/.ssh/`) — the
+images contain no configuration or secrets. Update SpotiDrome the same way;
+this stack uses its network and its bgutil container. For automatic updates,
+run that on a schedule (cron) or use [Watchtower](https://containrrr.dev/watchtower/).
 
 ## Notes / known trade-offs
 

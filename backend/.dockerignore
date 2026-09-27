@@ -1,0 +1,11 @@
+# Only what the Dockerfile COPYs belongs in the build context - never local
+# state, secrets or caches (these images are published publicly).
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+*.json
+__pycache__/
+*.pyc
+.git

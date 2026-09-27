@@ -1,4 +1,3 @@
-version: "3.9"
 
 # Joins Spotidrome's own docker network instead of creating a new one, so
 # this app can reach Spotidrome's already-running bgutil-pot-provider
@@ -10,6 +9,9 @@ networks:
 
 services:
   jam-frontend:
+    # Prebuilt image (updated weekly by GitHub Actions); `docker compose up -d --build`
+    # builds it from ./frontend instead.
+    image: ghcr.io/lun-astra/jamidrome-frontend:latest
     build: ./frontend
     ports:
       - "9998:9998"
@@ -24,6 +26,7 @@ services:
   # containers, so half of all requests would silently land on the wrong
   # app's backend and 404.
   jam-backend:
+    image: ghcr.io/lun-astra/jamidrome-backend:latest
     build: ./backend
     env_file:
       - ../spotidrome/.env

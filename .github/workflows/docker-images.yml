@@ -1,0 +1,75 @@
+# Builds and publishes the Docker images to GitHub Container Registry:
+#   ghcr.io/<owner>/jamidrome-backend   ghcr.io/<owner>/jamidrome-frontend
+# for linux/amd64 and linux/arm64.
+#
+# - every push to master   -> :latest (+ :sha-<commit>)
+# - every week (schedule)    -> :latest rebuilt from scratch, so base-image
+#                               security fixes and the newest yt-dlp /
+#                               ytmusicapi reach people even without code changes
+# - a version tag (v1.2.3)   -> :1.2.3 and :1.2 (pin these for stability)
+#
+# Users update with:  docker compose pull && docker compose up -d
+# Secrets never go into these images: .env, the SSH key and app state are
+# mounted at runtime (see docker-compose.yml and .dockerignore).
+name: Docker images
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  schedule:
+    - cron: '17 3 * * 1'   # Mondays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (registry names must be lowercase)
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/jamidrome-${{ matrix.component }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=jamidrome-${{ matrix.component }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          # The weekly run ignores the layer cache, so pip really fetches the
+          # newest yt-dlp/ytmusicapi and apt the newest security updates.
+          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
