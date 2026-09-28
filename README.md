@@ -282,6 +282,8 @@ scratch (base-image security fixes, newest yt-dlp / ytmusicapi); release tags
 docker compose pull && docker compose up -d
 ```
 
+**Host Controls → JamiDrome version → Check for updates** tells you whether a
+newer version is out (and what changed); updating is still this command.
 Settings and state stay where they are (`.env`, `./data/`, `~/.ssh/`) — the
 images contain no configuration or secrets. Update SpotiDrome the same way;
 this stack uses its network and its bgutil container. For automatic updates,

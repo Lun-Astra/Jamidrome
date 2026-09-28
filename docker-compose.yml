@@ -27,7 +27,12 @@ services:
   # app's backend and 404.
   jam-backend:
     image: ghcr.io/lun-astra/jamidrome-backend:latest
-    build: ./backend
+    build:
+      context: ./backend
+      # Local builds: `APP_COMMIT=$(git rev-parse HEAD) docker compose up -d --build`
+      # lets Host Controls > Check for updates know which version is running.
+      args:
+        APP_COMMIT: ${APP_COMMIT:-}
     env_file:
       - ../spotidrome/.env
       - ./.env

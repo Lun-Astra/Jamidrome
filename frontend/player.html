@@ -169,6 +169,7 @@ body::before{content:'';position:fixed;inset:0;
 .hm-btn-primary{background:var(--sp);color:#06210f;border-color:var(--sp);font-weight:600}
 .hm-row input{flex:1;min-width:0;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:12px;outline:none}
 .hm-sub{color:var(--text3);font-size:11.5px;line-height:1.5}
+.hm-upd-out{display:none;margin:8px 0 0;background:var(--bg);border:1px solid var(--border2);border-radius:8px;padding:8px 10px;font-size:11px;color:var(--text2);white-space:pre-wrap;max-height:180px;overflow-y:auto;font-family:monospace}
 .hm-newkey{display:none;margin-top:8px;padding:10px;border:1px solid rgba(30,215,96,.3);border-radius:8px;background:rgba(30,215,96,.06);font-size:12px}
 .hm-newkey code{display:block;margin:6px 0;overflow-wrap:anywhere;color:var(--sp)}
 </style>
@@ -254,6 +255,12 @@ body::before{content:'';position:fixed;inset:0;
         <input id="hm-key-name" placeholder="Key name, e.g. LunaDrome on my PC" maxlength="60">
         <button class="hm-btn hm-btn-primary" onclick="createApiKey()">+ Create</button>
       </div>
+      <div class="hm-sec-title">JamiDrome version</div>
+      <div class="hm-row" style="justify-content:space-between">
+        <div class="hm-sub">Running <b id="hm-version">…</b> · <span id="hm-upd-sub">checks GitHub for a newer version</span></div>
+        <button class="hm-btn" id="hm-check-upd" onclick="checkAppUpdate(true)">↻ Check for updates</button>
+      </div>
+      <pre class="hm-upd-out" id="hm-upd-out"></pre>
       <div class="hm-sec-title">Account</div>
       <div class="hm-row" style="justify-content:space-between">
         <div class="hm-sub">Logged in as <b id="hm-user">…</b></div>
@@ -953,6 +960,33 @@ function openHost(){
   document.getElementById('hm-newkey').style.display = 'none';
   refreshHostPanel();
   loadApiKeys();
+  checkAppUpdate(false);
+}
+
+// Which JamiDrome version runs, and whether GitHub has a newer one. Only tells
+// you - the update itself is `docker compose pull && docker compose up -d`.
+async function checkAppUpdate(force){
+  const btn = document.getElementById('hm-check-upd'), out = document.getElementById('hm-upd-out');
+  const ver = document.getElementById('hm-version'), sub = document.getElementById('hm-upd-sub');
+  if(force){ btn.disabled = true; btn.textContent = 'Checking…'; }
+  const show = text => { out.textContent = text; out.style.display = 'block'; };
+  try{
+    const r = await fetch(`${API}/update/check${force ? '?force=1' : ''}`), d = await r.json();
+    ver.textContent = d.current || 'unknown';
+    const cmd = `\n\nTo update, run this where JamiDrome's docker-compose.yml is:\n  ${d.command}`;
+    if(!force) out.style.display = 'none';
+    if(d.status === 'up_to_date'){ sub.textContent = 'up to date'; if(force) show('✓ You have the newest version.'); }
+    else if(d.status === 'update_available'){
+      const n = d.behind_by, changes = d.changes || [];
+      sub.textContent = `${n} update${n === 1 ? '' : 's'} available`;
+      show(`Newer version ${d.latest} is available (${n} change${n === 1 ? '' : 's'}):\n` +
+        changes.map(c => '• ' + c).join('\n') + (n > changes.length ? '\n• …' : '') + cmd);
+    }
+    else if(d.status === 'unknown'){ sub.textContent = 'version unknown';
+      if(force) show(`This build doesn't say which version it is (built locally?). The newest version is ${d.latest || '?'}.` + cmd); }
+    else { sub.textContent = 'update check failed'; if(force) show(d.error || 'Update check failed'); }
+  }catch(e){ if(force) show('Error: ' + e.message); }
+  finally{ btn.disabled = false; btn.textContent = '↻ Check for updates'; }
 }
 function closeHost(){
   document.getElementById('host-modal').classList.remove('show');

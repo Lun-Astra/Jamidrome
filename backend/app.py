@@ -1547,6 +1547,63 @@ def route_invite_check():
     return jsonify({"ok": True})
 
 
+# ─── App update check ────────────────────────────────────────────────────────
+# Host Controls > "Check for updates": compares the commit this image was built from
+# (APP_COMMIT, a build arg set by the Docker images workflow / docker-compose)
+# with the newest commit on GitHub. It only tells you; updating is one command
+# on the host (a container can't safely replace itself).
+APP_COMMIT = os.environ.get("APP_COMMIT", "").strip()
+UPDATE_REPO = os.environ.get("UPDATE_REPO", "Lun-Astra/Jamidrome").strip()
+UPDATE_COMMAND = "docker compose pull && docker compose up -d"
+_update_cache = {"at": 0.0, "data": None}
+
+
+def _github_json(path):
+    r = http.get(f"https://api.github.com/repos/{UPDATE_REPO}{path}", timeout=10,
+                 headers={"Accept": "application/vnd.github+json", "User-Agent": "JamiDrome-update-check"})
+    r.raise_for_status()
+    return r.json()
+
+
+@app.route("/update/check")
+def update_check():
+    now = time.time()
+    # GitHub allows 60 anonymous API calls an hour; the button needn't hit it every click.
+    if _update_cache["data"] and now - _update_cache["at"] < 300 and request.args.get("force") != "1":
+        return jsonify(_update_cache["data"])
+    data = {"current": APP_COMMIT[:7] or None, "repo": UPDATE_REPO, "command": UPDATE_COMMAND}
+    try:
+        head = _github_json("/commits/main")
+        data["latest"] = head["sha"][:7]
+        data["latest_date"] = head["commit"]["committer"]["date"]
+        if not APP_COMMIT:
+            data["status"] = "unknown"   # built without APP_COMMIT (e.g. an old local build)
+        elif head["sha"].startswith(APP_COMMIT):
+            data["status"] = "up_to_date"
+        else:
+            try:
+                cmp = _github_json(f"/compare/{APP_COMMIT}...{head['sha']}")
+            except http.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    cmp = None   # this build's commit isn't on GitHub (any more)
+                else:
+                    raise
+            if cmp is None:
+                data["status"] = "unknown"
+            elif cmp.get("ahead_by", 0) == 0:
+                data["status"] = "up_to_date"
+            else:
+                data["status"] = "update_available"
+                data["behind_by"] = cmp["ahead_by"]
+                data["changes"] = [c["commit"]["message"].split("\n", 1)[0]
+                                   for c in reversed(cmp.get("commits", []))][:8]
+    except Exception as e:
+        data["status"] = "error"
+        data["error"] = f"Couldn't reach GitHub: {e}"
+    _update_cache.update(at=now, data=data)
+    return jsonify(data)
+
+
 # ─── Host login & speaker ────────────────────────────────────────────────────
 
 @app.route("/session", methods=["GET"])

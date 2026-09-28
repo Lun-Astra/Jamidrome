@@ -73,3 +73,5 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Host Controls > Check for updates compares this with the newest commit on GitHub.
+          build-args: APP_COMMIT=${{ github.sha }}

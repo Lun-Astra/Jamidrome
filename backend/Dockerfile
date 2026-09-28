@@ -8,6 +8,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
+# The commit this image was built from, for Host Controls > Check for updates (set by
+# the Docker images workflow; docker-compose passes $APP_COMMIT for local builds).
+ARG APP_COMMIT=""
+ENV APP_COMMIT=$APP_COMMIT
 RUN mkdir -p /data/downloads
 EXPOSE 5000
 CMD ["gunicorn", "--workers", "1", "--threads", "16", "--timeout", "300", "--bind", "0.0.0.0:5000", "app:app"]
