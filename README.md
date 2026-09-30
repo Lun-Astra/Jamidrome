@@ -7,6 +7,13 @@ screen/speaker a few seconds later. It's a companion to
 pipeline, just a much faster front door for "play this one song right now"
 instead of syncing whole playlists.
 
+## Screenshots
+
+<p>
+  <img src="docs/screenshots/player.png" alt="The shared player screen: cover art, now playing, progress and the audio visualizer" width="62%">
+  <img src="docs/screenshots/request-phone.png" alt="The request page on a phone: now playing, emoji reactions, search and the queue" width="30%">
+</p>
+
 ## Two front doors, one backend
 
 - **Request** (port `9998`). Open this on your phone. Search, pick the
