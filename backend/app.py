@@ -366,6 +366,7 @@ def public_view(item, include_stream=False, session_id=None):
     v = {k: item.get(k) for k in ("id", "video_id", "title", "artist", "thumbnail", "album", "genre",
                                    "duration", "status", "requested_by", "added_at", "progress")}
     v["navidrome_song_id"] = item.get("navidrome_song_id")
+    v["from_queue"] = bool(item.get("from_queue"))
     v["source"] = "library" if str(item.get("video_id") or "").startswith("nd:") else "youtube"
     upvotes = item.get("upvotes") or []
     v["votes"] = len(upvotes)
@@ -1316,7 +1317,9 @@ def _queue_sort_key(item):
     what's displayed as up-next) instead of raw list position, so an
     upvoted track actually jumps the line rather than just looking more
     popular where it already sat."""
-    return (-len(item.get("upvotes") or []), item.get("added_at", 0))
+    # Songs taken over from the host's own player queue (LunaDrome, from_queue)
+    # come after everything requested by hand, so a request plays next.
+    return (-len(item.get("upvotes") or []), 1 if item.get("from_queue") else 0, item.get("added_at", 0))
 
 
 def _promote_next_if_idle():
@@ -1922,7 +1925,7 @@ def _resolve_youtube_id_bg(item_id, title, artist):
         print(f"[jam] YouTube id lookup failed for {artist} - {title}: {e}", flush=True)
 
 
-def _enqueue_library(song_id, requested_by="Anonymous", session_id=None):
+def _enqueue_library(song_id, requested_by="Anonymous", session_id=None, from_queue=False, added_at=None):
     """Queues a song straight from the Navidrome library — no search, no
     download; it streams from Navidrome through /stream/<id>."""
     if _is_banned(session_id):
@@ -1947,9 +1950,11 @@ def _enqueue_library(song_id, requested_by="Anonymous", session_id=None):
             "thumbnail": f"/api/cover/{item_id}",
             "navidrome_song_id": song_id, "cover_art_id": song.get("coverArt") or song_id,
             "requested_by": (requested_by or "Anonymous").strip()[:40] or "Anonymous",
-            "session_id": session_id, "added_at": time.time(), "progress": 100,
+            "session_id": session_id, "added_at": added_at or time.time(), "progress": 100,
             "status": "ready",
         }
+        if from_queue:
+            item["from_queue"] = True
         state["queue"].append(item)
         _promote_next_if_idle()
         save_state()
@@ -1970,6 +1975,36 @@ def route_queue_add_library():
         message, status = err
         return jsonify({"error": message}), status
     return jsonify(public_view(item, session_id=session_id))
+
+
+@app.route("/queue/add-library-batch", methods=["POST"])
+def route_queue_add_library_batch():
+    """Host only: takes over the host's player queue (LunaDrome, when it starts
+    playing a jam that's empty). Songs keep their order, are marked from_queue
+    (requests go before them) and the first one starts at start_seconds."""
+    data = request.json or {}
+    song_ids = [str(i).strip() for i in (data.get("song_ids") or []) if str(i).strip()][:100]
+    if not song_ids:
+        return jsonify({"error": "song_ids is required"}), 400
+    from_queue = bool(data.get("from_queue", True))
+    session_id = request.headers.get("X-Jam-Session", "")
+    now = time.time()
+    added, errors = [], []
+    for n, song_id in enumerate(song_ids):
+        item, err = _enqueue_library(song_id, data.get("requested_by"), session_id,
+                                     from_queue=from_queue, added_at=now + n * 0.001)
+        if err:
+            errors.append({"song_id": song_id, "error": err[0]})
+        else:
+            added.append(item)
+    start = float(data.get("start_seconds") or 0)
+    if added and start > 1:
+        with state_lock:
+            # Only if the first song is the one that just started playing.
+            if state["now_playing_id"] == added[0]["id"] and state["playback_started_at"] is not None:
+                state["playback_started_at"] -= min(start, float(added[0].get("duration") or start))
+                save_state()
+    return jsonify({"added": [public_view(i, session_id=session_id) for i in added], "errors": errors})
 
 
 @app.route("/cover/<item_id>")
