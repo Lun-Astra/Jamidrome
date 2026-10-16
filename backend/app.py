@@ -57,10 +57,10 @@ MAX_HISTORY         = 50
 ADVANCE_BUFFER_SEC   = 5     # grace period added on top of a track's own duration
                              # before the server auto-advances without a client signal
 SEARCH_RESULT_COUNT  = 10
-SKIP_VOTE_THRESHOLD  = 1     # a single vote skips — no accounts/presence
-                             # tracking to compute a real quorum against, and
-                             # requiring several people to agree was more
-                             # friction than the feature was worth.
+# Vote-skip needs a majority of the guests who are in the jam right now: the
+# request pages that polled /queue within LISTENER_TIMEOUT_SEC (they poll
+# every ~2 s). With one guest a single vote still skips (LunaDrome #35).
+LISTENER_TIMEOUT_SEC = 30
 # Set when the request/player pages sit behind a reverse proxy on separate
 # hostnames (e.g. jam.example.com / aanvragenjam.example.com) rather than
 # being reached directly on :9999/:9998 — there's no way to derive one
@@ -358,6 +358,29 @@ def _resume_locked():
     state["pause_reason"] = None
 
 
+_guests_seen = {}            # guest session id -> last /queue poll (time.time())
+_guests_seen_lock = threading.Lock()
+
+
+def _note_guest(session_id):
+    if session_id:
+        with _guests_seen_lock:
+            _guests_seen[session_id] = time.time()
+
+
+def _listener_count():
+    cutoff = time.time() - LISTENER_TIMEOUT_SEC
+    with _guests_seen_lock:
+        for sid in [s for s, t in _guests_seen.items() if t < cutoff]:
+            del _guests_seen[sid]
+        return len(_guests_seen)
+
+
+def _skip_threshold():
+    """Votes needed to skip: more than half of the guests listening now."""
+    return _listener_count() // 2 + 1
+
+
 def _is_banned(session_id):
     return bool(session_id) and session_id in (state.get("banned_sessions") or [])
 
@@ -374,7 +397,7 @@ def public_view(item, include_stream=False, session_id=None):
     if item.get("status") == "playing":
         skip_votes = item.get("skip_votes") or []
         v["skip_votes"] = len(skip_votes)
-        v["skip_threshold"] = SKIP_VOTE_THRESHOLD
+        v["skip_threshold"] = _skip_threshold()
         v["voted_skip_by_me"] = bool(session_id) and session_id in skip_votes
     if include_stream:
         # /api/ prefix matters: nginx only proxies paths under /api/ to this
@@ -1797,6 +1820,8 @@ def route_search():
 def route_queue_get():
     session_id = request.headers.get("X-Jam-Session", "")
     is_host = _is_host()  # outside state_lock — _is_host takes it itself
+    if not is_host and not _is_banned(session_id):
+        _note_guest(session_id)   # a guest with the request page open = in the jam
     with state_lock:
         now_playing = find_item(state["now_playing_id"]) if state["now_playing_id"] else None
         upcoming = sorted((i for i in state["queue"] if i["status"] != "playing"), key=_queue_sort_key)
@@ -1810,6 +1835,7 @@ def route_queue_get():
             "paused": state["paused"],
             "pause_started_at": state["pause_started_at"],
             "autoplay_enabled": state.get("autoplay_enabled", True),
+            "listeners": _listener_count(),
             "queue": [public_view(i, session_id=session_id) for i in upcoming],
             "history": [public_view(i, session_id=session_id) for i in state["history"][-10:]],
         })
@@ -2056,11 +2082,9 @@ def route_queue_upvote(item_id):
 @app.route("/queue/<item_id>/vote-skip", methods=["POST"])
 def route_vote_skip(item_id):
     """Democratic skip for guests on the request page, who have no other
-    way to skip — the player page's own Skip button already acts
-    immediately for whoever's standing at the actual display. A small
-    fixed threshold rather than a real majority: there's no accounts or
-    presence tracking here to know how many people are actually in the
-    jam right now to compute one against."""
+    way to skip — the player page's own Skip button (and LunaDrome's) already
+    acts immediately for the host. Needs a majority of the guests who are in
+    the jam right now (_skip_threshold)."""
     session_id = request.headers.get("X-Jam-Session", "") or request.remote_addr or ""
     if _is_banned(session_id):
         return jsonify({"error": "You've been removed from this jam by the host"}), 403
@@ -2072,12 +2096,13 @@ def route_vote_skip(item_id):
         if session_id not in skip_votes:
             skip_votes.append(session_id)
         count = len(skip_votes)
-        will_skip = count >= SKIP_VOTE_THRESHOLD
+        threshold = _skip_threshold()
+        will_skip = count >= threshold
         if not will_skip:
             save_state()
     if will_skip:
         advance(expected_id=item_id)  # outside state_lock — advance() takes its own
-    return jsonify({"skip_votes": min(count, SKIP_VOTE_THRESHOLD), "skip_threshold": SKIP_VOTE_THRESHOLD,
+    return jsonify({"skip_votes": min(count, threshold), "skip_threshold": threshold,
                     "skipped": will_skip})
 
 

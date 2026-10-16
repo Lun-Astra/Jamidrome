@@ -249,6 +249,7 @@ async function voteSkip(id){
     const r = await fetch(`${API}/queue/${id}/vote-skip`, {method:'POST', headers: SESSION_HEADERS});
     const d = await r.json();
     if(d.skipped) toast('Skip vote passed — moving on');
+    else if(d.skip_threshold) toast(`Voted to skip — ${d.skip_votes}/${d.skip_threshold} votes`);
     refreshQueue();
   }catch(e){}
 }
@@ -291,7 +292,7 @@ async function refreshQueue(){
           <div class="np-artist">${esc(d.now_playing.artist)} · requested by ${esc(d.now_playing.requested_by)}</div>
           <div class="np-bar"><div class="np-bar-fill" style="width:${pct}%"></div></div>
         </div>
-        <button class="skip-vote-btn ${d.now_playing.voted_skip_by_me ? 'on' : ''}" onclick="voteSkip('${d.now_playing.id}')" title="Vote to skip this track">⏭ ${sv}/${st}</button>`;
+        <button class="skip-vote-btn ${d.now_playing.voted_skip_by_me ? 'on' : ''}" onclick="voteSkip('${d.now_playing.id}')" title="Vote to skip this track: ${st} of the ${d.listeners || 1} ${(d.listeners || 1) === 1 ? 'person' : 'people'} here need to vote">⏭ ${sv}/${st}</button>`;
     } else {
       np.innerHTML = '<div class="np-empty">Nothing playing yet — be the first to add a song.</div>';
     }
